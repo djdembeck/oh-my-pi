@@ -303,7 +303,7 @@ function buildParams(
 	const messages: ResponseInput = [...conversationMessages];
 
 	if (context.systemPrompt) {
-		const role = model.reasoning ? "developer" : "system";
+		const role = model.reasoning && supportsDeveloperRole(model) ? "developer" : "system";
 		messages.unshift({
 			role,
 			content: context.systemPrompt.toWellFormed(),
@@ -390,6 +390,16 @@ function isAzureOpenAIBaseUrl(baseUrl: string): boolean {
 function supportsStrictMode(model: Model<"openai-responses">): boolean {
 	if (model.provider === "openai" || model.provider === "azure" || model.provider === "github-copilot") return true;
 
+	const baseUrl = model.baseUrl.toLowerCase();
+	return (
+		baseUrl.includes("api.openai.com") ||
+		baseUrl.includes(".openai.azure.com") ||
+		baseUrl.includes("models.inference.ai.azure.com")
+	);
+}
+
+function supportsDeveloperRole(model: Model<"openai-responses">): boolean {
+	if (model.provider === "openai" || model.provider === "github-copilot") return true;
 	const baseUrl = model.baseUrl.toLowerCase();
 	return (
 		baseUrl.includes("api.openai.com") ||
