@@ -10,6 +10,7 @@
 - Improved system prompt role handling to be provider-aware with fallback to system role when developer role is not supported
 
 ### Fixed
+- Fixed `supportsDeveloperRole` to recognize all GitHub Copilot endpoint patterns (api.individual.githubcopilot.com, api.enterprise.githubcopilot.com, copilot-api.* domains) preventing incorrect role downgrade for reasoning requests
 - Fixed role assignment for reasoning-enabled models to use developer role when supported
 ## [13.17.0] - 2026-03-30
 

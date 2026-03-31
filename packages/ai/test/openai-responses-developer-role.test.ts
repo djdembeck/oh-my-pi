@@ -60,4 +60,19 @@ describe("supportsDeveloperRole", () => {
 		const model = { provider: "custom", baseUrl: "https://azure.com/openai/deployments/my-model" } as Model;
 		expect(supportsDeveloperRole(model)).toBe(true);
 	});
+
+	it("returns true for github-copilot provider with api.individual.githubcopilot.com", () => {
+		const model = { provider: "github-copilot", baseUrl: "https://api.individual.githubcopilot.com" } as Model;
+		expect(supportsDeveloperRole(model)).toBe(true);
+	});
+
+	it("returns true for github-copilot provider with api.enterprise.githubcopilot.com", () => {
+		const model = { provider: "github-copilot", baseUrl: "https://api.enterprise.githubcopilot.com" } as Model;
+		expect(supportsDeveloperRole(model)).toBe(true);
+	});
+
+	it("returns true for github-copilot provider with copilot-api enterprise domain", () => {
+		const model = { provider: "github-copilot", baseUrl: "https://copilot-api.mycompany.com" } as Model;
+		expect(supportsDeveloperRole(model)).toBe(true);
+	});
 });

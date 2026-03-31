@@ -405,7 +405,8 @@ export function supportsDeveloperRole(model: Pick<Model, "provider" | "baseUrl">
 		baseUrl.includes(".openai.azure.com") ||
 		baseUrl.includes("azure.com/openai") ||
 		baseUrl.includes("models.inference.ai.azure.com") ||
-		baseUrl.includes("api.githubcopilot.com")
+		baseUrl.includes("githubcopilot.com") ||
+		baseUrl.includes("copilot-api.")
 	);
 }
 
