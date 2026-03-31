@@ -2,16 +2,8 @@
 
 ## [Unreleased]
 
-### Added
-- Support for developer role in system prompts for OpenAI and Azure endpoints with reasoning-enabled models
-- New `supportsDeveloperRole` function to validate developer role availability based on provider and base URL
-
-### Changed
-- Improved system prompt role handling to be provider-aware with fallback to system role when developer role is not supported
-
 ### Fixed
-- Fixed `supportsDeveloperRole` to recognize all GitHub Copilot endpoint patterns (api.individual.githubcopilot.com, api.enterprise.githubcopilot.com, copilot-api.* domains) preventing incorrect role downgrade for reasoning requests
-- Fixed role assignment for reasoning-enabled models to use developer role when supported
+- Fixed `omp commit` failing with HTTP 400 errors when using reasoning-enabled models on OpenAI-compatible endpoints that don't support the `developer` role (e.g., GitHub Copilot, custom proxies). Now falls back to `system` role when `developer` is unsupported.
 ## [13.17.0] - 2026-03-30
 
 ### Changed
