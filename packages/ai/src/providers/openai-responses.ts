@@ -404,6 +404,7 @@ export function supportsDeveloperRole(model: Pick<Model, "provider" | "baseUrl">
 	return (
 		baseUrl.includes("api.openai.com") ||
 		baseUrl.includes(".openai.azure.com") ||
+		baseUrl.includes("azure.com/openai") ||
 		baseUrl.includes("models.inference.ai.azure.com")
 	);
 }
