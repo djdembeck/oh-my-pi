@@ -5,12 +5,9 @@
 ### Added
 - Support for developer role in system prompts for OpenAI and Azure endpoints with reasoning-enabled models
 - New `supportsDeveloperRole` function to validate developer role availability based on provider and base URL
-- Enhanced reasoning content handling with strict role enforcement for Azure
-- Support for AbortSignal with idle-timeout-based abort handling for stalled streams
 
 ### Changed
 - Improved system prompt role handling to be provider-aware with fallback to system role when developer role is not supported
-- Updated message construction logic to handle reasoning content properly across all providers
 
 ### Fixed
 - Fixed role assignment for reasoning-enabled models to use developer role when supported

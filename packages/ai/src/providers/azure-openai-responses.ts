@@ -22,6 +22,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { getOpenAIStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
+import { supportsDeveloperRole } from "./openai-responses";
 import {
 	appendResponsesToolResultMessages,
 	convertResponsesAssistantMessage,
@@ -329,7 +330,7 @@ function convertMessages(
 	const knownCallIds = new Set<string>();
 
 	if (context.systemPrompt) {
-		const role = model.reasoning ? "developer" : "system";
+		const role = model.reasoning && supportsDeveloperRole(model) ? "developer" : "system";
 		messages.push({
 			role,
 			content: context.systemPrompt.toWellFormed(),

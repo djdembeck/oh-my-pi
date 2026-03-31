@@ -398,7 +398,7 @@ function supportsStrictMode(model: Model<"openai-responses">): boolean {
 	);
 }
 
-function supportsDeveloperRole(model: Model<"openai-responses">): boolean {
+export function supportsDeveloperRole(model: Pick<Model, "provider" | "baseUrl">): boolean {
 	if (model.provider === "openai" || model.provider === "github-copilot") return true;
 	const baseUrl = model.baseUrl.toLowerCase();
 	return (
