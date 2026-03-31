@@ -3,14 +3,24 @@ import { supportsDeveloperRole } from "../src/providers/openai-responses";
 import type { Model } from "../src/types";
 
 describe("supportsDeveloperRole", () => {
-	it("returns true for openai provider", () => {
+	it("returns true for openai provider with official API base URL", () => {
 		const model = { provider: "openai", baseUrl: "https://api.openai.com/v1" } as Model;
 		expect(supportsDeveloperRole(model)).toBe(true);
+	});
+
+	it("returns false for openai provider with custom proxy base URL", () => {
+		const model = { provider: "openai", baseUrl: "https://my-proxy.example.com/v1" } as Model;
+		expect(supportsDeveloperRole(model)).toBe(false);
 	});
 
 	it("returns true for github-copilot provider", () => {
 		const model = { provider: "github-copilot", baseUrl: "https://api.githubcopilot.com" } as Model;
 		expect(supportsDeveloperRole(model)).toBe(true);
+	});
+
+	it("returns false for github-copilot provider with custom proxy base URL", () => {
+		const model = { provider: "github-copilot", baseUrl: "https://proxy.example.com/v1" } as Model;
+		expect(supportsDeveloperRole(model)).toBe(false);
 	});
 
 	it("returns true for Azure OpenAI base URL", () => {

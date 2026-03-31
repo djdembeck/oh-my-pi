@@ -399,13 +399,13 @@ function supportsStrictMode(model: Model<"openai-responses">): boolean {
 }
 
 export function supportsDeveloperRole(model: Pick<Model, "provider" | "baseUrl">): boolean {
-	if (model.provider === "openai" || model.provider === "github-copilot") return true;
 	const baseUrl = model.baseUrl.toLowerCase();
 	return (
 		baseUrl.includes("api.openai.com") ||
 		baseUrl.includes(".openai.azure.com") ||
 		baseUrl.includes("azure.com/openai") ||
-		baseUrl.includes("models.inference.ai.azure.com")
+		baseUrl.includes("models.inference.ai.azure.com") ||
+		baseUrl.includes("api.githubcopilot.com")
 	);
 }
 
