@@ -114,7 +114,8 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			// Create Azure OpenAI client
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const client = createClient(model, apiKey, options);
-			const params = buildParams(model, context, options, deploymentName);
+			const { baseUrl } = resolveAzureConfig(model, options);
+			const params = buildParams(model, context, options, deploymentName, baseUrl);
 			const requestAbortController = new AbortController();
 			const requestSignal = options?.signal
 				? AbortSignal.any([options.signal, requestAbortController.signal])
@@ -125,7 +126,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				api: output.api,
 				model: model.id,
 				method: "POST",
-				url: `${resolveAzureConfig(model, options).baseUrl}/responses`,
+				url: `${baseUrl}/responses`,
 				body: params,
 			};
 			const openaiStream = await client.responses.create(params, { signal: requestSignal });
@@ -246,8 +247,9 @@ function buildParams(
 	context: Context,
 	options: AzureOpenAIResponsesOptions | undefined,
 	deploymentName: string,
+	resolvedBaseUrl?: string,
 ) {
-	const messages = convertMessages(model, context, true);
+	const messages = convertMessages(model, context, true, resolvedBaseUrl);
 
 	const params: AzureOpenAIResponsesSamplingParams = {
 		model: deploymentName,
@@ -324,13 +326,14 @@ function convertMessages(
 	model: Model<"azure-openai-responses">,
 	context: Context,
 	strictResponsesPairing: boolean,
+	resolvedBaseUrl?: string,
 ): ResponseInput {
 	const messages: ResponseInput = [];
 	const transformedMessages = transformMessages(context.messages, model, normalizeResponsesToolCallIdForTransform);
 	const knownCallIds = new Set<string>();
 
 	if (context.systemPrompt) {
-		const role = model.reasoning && supportsDeveloperRole(model) ? "developer" : "system";
+		const role = model.reasoning && supportsDeveloperRole(resolvedBaseUrl ?? model) ? "developer" : "system";
 		messages.push({
 			role,
 			content: context.systemPrompt.toWellFormed(),

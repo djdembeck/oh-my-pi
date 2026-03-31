@@ -167,7 +167,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.initiatorOverride,
 			);
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
-			const { params } = buildParams(model, context, options, providerSessionState);
+			const { params } = buildParams(model, context, options, providerSessionState, baseUrl);
 			const requestAbortController = new AbortController();
 			const requestSignal = options?.signal
 				? AbortSignal.any([options.signal, requestAbortController.signal])
@@ -290,6 +290,7 @@ function buildParams(
 	context: Context,
 	options: OpenAIResponsesOptions | undefined,
 	providerSessionState: OpenAIResponsesProviderSessionState | undefined,
+	resolvedBaseUrl?: string,
 ): { conversationMessages: ResponseInput; params: OpenAIResponsesSamplingParams } {
 	const strictResponsesPairing =
 		options?.strictResponsesPairing ??
@@ -303,7 +304,7 @@ function buildParams(
 	const messages: ResponseInput = [...conversationMessages];
 
 	if (context.systemPrompt) {
-		const role = model.reasoning && supportsDeveloperRole(model) ? "developer" : "system";
+		const role = model.reasoning && supportsDeveloperRole(resolvedBaseUrl ?? model) ? "developer" : "system";
 		messages.unshift({
 			role,
 			content: context.systemPrompt.toWellFormed(),
@@ -398,8 +399,9 @@ function supportsStrictMode(model: Model<"openai-responses">): boolean {
 	);
 }
 
-export function supportsDeveloperRole(model: Pick<Model, "provider" | "baseUrl">): boolean {
-	const baseUrl = model.baseUrl.toLowerCase();
+export function supportsDeveloperRole(modelOrBaseUrl: Pick<Model, "provider" | "baseUrl"> | string): boolean {
+	const baseUrl =
+		typeof modelOrBaseUrl === "string" ? modelOrBaseUrl.toLowerCase() : (modelOrBaseUrl.baseUrl ?? "").toLowerCase();
 	return (
 		baseUrl.includes("api.openai.com") ||
 		baseUrl.includes(".openai.azure.com") ||
