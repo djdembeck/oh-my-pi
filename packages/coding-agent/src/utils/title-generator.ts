@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { completeSimple } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import { renderPromptTemplate, type TitleTemplateContext } from "../config/prompt-templates";
@@ -43,7 +43,9 @@ export async function loadTitleTemplate(cwd: string): Promise<string> {
 			return projectContent;
 		}
 	} catch (err) {
-		logger.debug("title-generator: failed to load project title template", { error: String(err) });
+		if (!isEnoent(err)) {
+			logger.debug("title-generator: failed to load project title template", { error: String(err) });
+		}
 	}
 
 	// Global template: ~/.omp/agent/prompts/title.md
@@ -54,7 +56,9 @@ export async function loadTitleTemplate(cwd: string): Promise<string> {
 			return globalContent;
 		}
 	} catch (err) {
-		logger.debug("title-generator: failed to load global title template", { error: String(err) });
+		if (!isEnoent(err)) {
+			logger.debug("title-generator: failed to load global title template", { error: String(err) });
+		}
 	}
 
 	// Fall back to built-in default

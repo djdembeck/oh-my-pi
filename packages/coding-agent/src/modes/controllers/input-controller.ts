@@ -27,6 +27,40 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
+	/**
+	 * Helper to generate and set session title on first user message.
+	 * Runs in parallel to not block user interaction.
+	 */
+	private generateAndSetSessionTitle(text: string, titleOverride?: string): void {
+		const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
+		const shouldGenerateTitle = !hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE;
+		if (!shouldGenerateTitle) return;
+
+		const registry = this.ctx.session.modelRegistry;
+		const cwd = this.ctx.sessionManager.getCwd();
+		loadTitleTemplate(cwd)
+			.then(async customTemplate => {
+				return generateSessionTitle(
+					titleOverride ?? text,
+					registry,
+					this.ctx.settings,
+					this.ctx.session.sessionId,
+					this.ctx.session.model,
+					customTemplate,
+					cwd,
+				);
+			})
+			.then(async title => {
+				if (title) {
+					await this.ctx.sessionManager.setSessionName(title);
+					setSessionTerminalTitle(title, this.ctx.sessionManager.getCwd());
+				}
+			})
+			.catch((err: unknown) => {
+				logger.debug("title-generator: failed to generate session title", { error: String(err) });
+			});
+	}
+
 	setupKeyHandlers(): void {
 		this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
 		this.ctx.editor.shouldBypassAutocompleteOnEscape = () =>
@@ -206,40 +240,10 @@ export class InputController {
 			let inputImages = this.ctx.pendingImages.length > 0 ? [...this.ctx.pendingImages] : undefined;
 
 			if (runner?.hasHandlers("input")) {
-				const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-				const shouldGenerateTitle = !hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE;
 				const result = await runner.emitInput(text, inputImages, "interactive");
 				if (result?.handled) {
 					// Generate title for extension commands on first message
-					if (shouldGenerateTitle) {
-						logger.debug("title-generator: starting for extension", { text });
-						const registry = this.ctx.session.modelRegistry;
-						const cwd = this.ctx.sessionManager.getCwd();
-						loadTitleTemplate(cwd)
-							.then(async customTemplate => {
-								logger.debug("title-generator: template loaded for extension", { hasCustomTemplate: !!customTemplate });
-								return generateSessionTitle(
-									text,
-									registry,
-									this.ctx.settings,
-									this.ctx.session.sessionId,
-									this.ctx.session.model,
-									customTemplate,
-									cwd,
-								);
-							})
-							.then(async title => {
-								logger.debug("title-generator: got title for extension", { title });
-								if (title) {
-									await this.ctx.sessionManager.setSessionName(title);
-									setSessionTerminalTitle(title, this.ctx.sessionManager.getCwd());
-									logger.debug("title-generator: set session name for extension", { title });
-								}
-							})
-							.catch((err: unknown) => {
-								logger.debug("title-generator: failed to generate session title for extension", { error: String(err) });
-							});
-					}
+					this.generateAndSetSessionTitle(text);
 					this.ctx.editor.setText("");
 					this.ctx.pendingImages = [];
 					return;
@@ -287,41 +291,10 @@ export class InputController {
 							args: args || undefined,
 							lineCount: body ? body.split("\n").length : 0,
 						};
-						// Check if title generation needed BEFORE prompt adds user message
-						const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-						const shouldGenerateTitle = !hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE;
 
-						// Start title generation BEFORE prompt so it runs in parallel
-						if (shouldGenerateTitle) {
-							logger.debug("title-generator: starting for skill", { skillName, args });
-							const registry = this.ctx.session.modelRegistry;
-							const cwd = this.ctx.sessionManager.getCwd();
-							const titleInput = args || skillName || commandName;
-							loadTitleTemplate(cwd)
-								.then(async customTemplate => {
-									logger.debug("title-generator: template loaded for skill", { hasCustomTemplate: !!customTemplate });
-									return generateSessionTitle(
-										titleInput,
-										registry,
-										this.ctx.settings,
-										this.ctx.session.sessionId,
-										this.ctx.session.model,
-										customTemplate,
-										cwd,
-									);
-								})
-								.then(async title => {
-									logger.debug("title-generator: got title for skill", { title });
-									if (title) {
-										await this.ctx.sessionManager.setSessionName(title);
-										setSessionTerminalTitle(title, this.ctx.sessionManager.getCwd());
-										logger.debug("title-generator: set session name for skill", { title });
-									}
-								})
-								.catch((err: unknown) => {
-									logger.debug("title-generator: failed to generate session title for skill", { error: String(err) });
-								});
-						}
+						// Generate title for skill on first message (run in parallel)
+						const titleInput = args || skillName || commandName;
+						this.generateAndSetSessionTitle(args, titleInput);
 
 						await this.ctx.session.promptCustomMessage(
 							{
@@ -406,33 +379,8 @@ export class InputController {
 			// First, move any pending bash components to chat
 			this.ctx.flushPendingBashComponents();
 
-			// Generate session title on first message
-			const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-			if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE) {
-				const registry = this.ctx.session.modelRegistry;
-				const cwd = this.ctx.sessionManager.getCwd();
-				loadTitleTemplate(cwd)
-					.then(async customTemplate => {
-						return generateSessionTitle(
-							text,
-							registry,
-							this.ctx.settings,
-							this.ctx.session.sessionId,
-							this.ctx.session.model,
-							customTemplate,
-							cwd,
-						);
-					})
-					.then(async title => {
-						if (title) {
-							await this.ctx.sessionManager.setSessionName(title);
-							setSessionTerminalTitle(title, this.ctx.sessionManager.getCwd());
-						}
-					})
-					.catch((err: unknown) => {
-						logger.debug("title-generator: failed to generate session title", { error: String(err) });
-					});
-			}
+			// Generate title for normal message on first message
+			this.generateAndSetSessionTitle(text);
 
 			if (this.ctx.onInputCallback) {
 				// Include any pending images from clipboard paste
