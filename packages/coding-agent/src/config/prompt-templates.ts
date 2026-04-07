@@ -25,6 +25,19 @@ export interface TemplateContext extends Record<string, unknown> {
 	arguments?: string;
 }
 
+/**
+ * Context interface for session title template rendering.
+ * Provides variables available when generating custom session titles.
+ */
+export interface TitleTemplateContext extends TemplateContext {
+	/** The first message from the user that initiated the session */
+	firstMessage: string;
+	/** The current working directory when the session started */
+	cwd: string;
+	/** ISO 8601 formatted timestamp when the session started */
+	timestamp: string;
+}
+
 const handlebars = Handlebars.create();
 
 handlebars.registerHelper("arg", function (this: TemplateContext, index: number | string): string {
@@ -328,7 +341,10 @@ export function appendInlineArgsFallback(
 }
 
 export function renderPromptTemplate(template: string, context: TemplateContext = {}): string {
-	const compiled = handlebars.compile(template, { noEscape: true, strict: false });
+	const compiled = handlebars.compile(template, {
+		noEscape: true,
+		strict: false,
+	});
 	const rendered = compiled(context ?? {});
 	return formatPromptContent(rendered, { renderPhase: "post-render" });
 }
@@ -345,7 +361,11 @@ async function loadTemplatesFromDir(
 	try {
 		const glob = new Bun.Glob("**/*");
 		const entries = [];
-		for await (const entry of glob.scan({ cwd: dir, absolute: false, onlyFiles: false })) {
+		for await (const entry of glob.scan({
+			cwd: dir,
+			absolute: false,
+			onlyFiles: false,
+		})) {
 			entries.push(entry);
 		}
 
@@ -362,7 +382,9 @@ async function loadTemplatesFromDir(
 
 				if (entry.endsWith(".md")) {
 					const rawContent = await file.text();
-					const { frontmatter, body } = parseFrontmatter(rawContent, { source: fullPath });
+					const { frontmatter, body } = parseFrontmatter(rawContent, {
+						source: fullPath,
+					});
 
 					const name = entry.split("/").pop()!.slice(0, -3); // Remove .md extension
 
@@ -399,14 +421,20 @@ async function loadTemplatesFromDir(
 					});
 				}
 			} catch (error) {
-				logger.warn("Failed to load prompt template", { path: fullPath, error: String(error) });
+				logger.warn("Failed to load prompt template", {
+					path: fullPath,
+					error: String(error),
+				});
 			}
 		}
 	} catch (error) {
 		if (!fs.existsSync(dir)) {
 			return [];
 		}
-		logger.warn("Failed to scan prompt templates directory", { dir, error: String(error) });
+		logger.warn("Failed to scan prompt templates directory", {
+			dir,
+			error: String(error),
+		});
 	}
 
 	return templates;
@@ -459,7 +487,11 @@ export function expandPromptTemplate(text: string, templates: PromptTemplate[]):
 		const argsText = args.join(" ");
 		const usesInlineArgPlaceholders = templateUsesInlineArgPlaceholders(template.content);
 		const substituted = substituteArgs(template.content, args);
-		const rendered = renderPromptTemplate(substituted, { args, ARGUMENTS: argsText, arguments: argsText });
+		const rendered = renderPromptTemplate(substituted, {
+			args,
+			ARGUMENTS: argsText,
+			arguments: argsText,
+		});
 		return appendInlineArgsFallback(rendered, argsText, usesInlineArgPlaceholders);
 	}
 

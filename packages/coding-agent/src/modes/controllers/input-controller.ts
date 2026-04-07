@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { sanitizeText } from "@oh-my-pi/pi-natives";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
-import { $env } from "@oh-my-pi/pi-utils";
+import { $env, logger } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
@@ -14,7 +14,7 @@ import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput } from "../../utils/image-input";
 import { resizeImage } from "../../utils/image-resize";
-import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
+import { generateSessionTitle, loadTitleTemplate, setSessionTerminalTitle } from "../../utils/title-generator";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -193,7 +193,11 @@ export class InputController {
 				if (this.ctx.onInputCallback) {
 					this.ctx.editor.setText("");
 					this.ctx.pendingImages = [];
-					this.ctx.onInputCallback({ text: "", cancelled: false, started: true });
+					this.ctx.onInputCallback({
+						text: "",
+						cancelled: false,
+						started: true,
+					});
 				}
 				return;
 			}
@@ -322,7 +326,10 @@ export class InputController {
 				this.ctx.editor.setText("");
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.pendingImages = [];
-				await this.ctx.session.prompt(text, { streamingBehavior: "steer", images });
+				await this.ctx.session.prompt(text, {
+					streamingBehavior: "steer",
+					images,
+				});
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
 				return;
@@ -336,14 +343,28 @@ export class InputController {
 			const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
 			if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE) {
 				const registry = this.ctx.session.modelRegistry;
-				generateSessionTitle(text, registry, this.ctx.settings, this.ctx.session.sessionId, this.ctx.session.model)
+				const cwd = this.ctx.sessionManager.getCwd();
+				loadTitleTemplate(cwd)
+					.then(async customTemplate => {
+						return generateSessionTitle(
+							text,
+							registry,
+							this.ctx.settings,
+							this.ctx.session.sessionId,
+							this.ctx.session.model,
+							customTemplate,
+							cwd,
+						);
+					})
 					.then(async title => {
 						if (title) {
 							await this.ctx.sessionManager.setSessionName(title);
 							setSessionTerminalTitle(title, this.ctx.sessionManager.getCwd());
 						}
 					})
-					.catch(() => {});
+					.catch((err: unknown) => {
+						logger.debug("title-generator: failed to generate session title", { error: String(err) });
+					});
 			}
 
 			if (this.ctx.onInputCallback) {
@@ -523,7 +544,11 @@ export class InputController {
 							data: imageData.data,
 							mimeType: imageData.mimeType,
 						});
-						imageData = { type: "image", data: resized.data, mimeType: resized.mimeType };
+						imageData = {
+							type: "image",
+							data: resized.data,
+							mimeType: resized.mimeType,
+						};
 					} catch {
 						// Keep the normalized image when resize fails.
 					}
@@ -717,7 +742,10 @@ export class InputController {
 				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]
 				: ["inherit", "inherit", "inherit"];
 
-			const result = await openInEditor(editorCmd, currentText, { extension: ".omp.md", stdio });
+			const result = await openInEditor(editorCmd, currentText, {
+				extension: ".omp.md",
+				stdio,
+			});
 			if (result !== null) {
 				this.ctx.editor.setText(result);
 			}

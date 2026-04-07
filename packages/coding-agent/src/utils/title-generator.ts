@@ -1,6 +1,7 @@
 /**
  * Generate session titles using a smol, fast model.
  */
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
@@ -8,10 +9,57 @@ import { completeSimple } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
-import { renderPromptTemplate } from "../config/prompt-templates";
+import { renderPromptTemplate, type TitleTemplateContext } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { toReasoningEffort } from "../thinking";
+
+/**
+ * Load title template with priority resolution.
+ * Priority: project > global > default
+ *
+ * Custom templates allow users to customize how session titles are generated.
+ * The template uses Handlebars syntax and receives context variables:
+ * - `firstMessage`: The first user message (truncated to 2000 chars)
+ * - `cwd`: Current working directory
+ * - `timestamp`: ISO timestamp of session start
+ *
+ * File locations (checked in order, first non-empty wins):
+ * 1. Project: `.omp/prompts/title.md`
+ * 2. Global: `~/.omp/agent/prompts/title.md`
+ * 3. Built-in default from `title-system.md`
+ *
+ * @param cwd Current working directory (for project-level template)
+ * @returns The template content string (never null - always falls back to default)
+ */
+export async function loadTitleTemplate(cwd: string): Promise<string> {
+	const home = os.homedir();
+
+	// Project template: .omp/prompts/title.md
+	const projectTemplatePath = path.join(cwd, ".omp", "prompts", "title.md");
+	try {
+		const projectContent = await Bun.file(projectTemplatePath).text();
+		if (projectContent.trim().length > 0) {
+			return projectContent;
+		}
+	} catch (err) {
+		logger.debug("title-generator: failed to load project title template", { error: String(err) });
+	}
+
+	// Global template: ~/.omp/agent/prompts/title.md
+	const globalTemplatePath = path.join(home, ".omp", "agent", "prompts", "title.md");
+	try {
+		const globalContent = await Bun.file(globalTemplatePath).text();
+		if (globalContent.trim().length > 0) {
+			return globalContent;
+		}
+	} catch (err) {
+		logger.debug("title-generator: failed to load global title template", { error: String(err) });
+	}
+
+	// Fall back to built-in default
+	return titleSystemPrompt;
+}
 
 const TITLE_SYSTEM_PROMPT = renderPromptTemplate(titleSystemPrompt);
 
@@ -47,6 +95,8 @@ function getTitleModel(
  * @param registry Model registry
  * @param settings Settings used to resolve the smol role, including per-role thinking
  * @param sessionId Optional session id for sticky API key selection
+ * @param currentModel Optional current model to use as fallback
+ * @param customTemplate Optional custom Handlebars template for the system prompt
  */
 export async function generateSessionTitle(
 	firstMessage: string,
@@ -54,6 +104,8 @@ export async function generateSessionTitle(
 	settings: Settings,
 	sessionId?: string,
 	currentModel?: Model<Api>,
+	customTemplate?: string,
+	cwd?: string,
 ): Promise<string | null> {
 	const candidate = getTitleModel(registry, settings, currentModel);
 	if (!candidate) {
@@ -77,9 +129,29 @@ ${truncatedMessage}
 		return null;
 	}
 
+	// Determine system prompt: custom template or default
+	let systemPrompt: string;
+	if (customTemplate) {
+		const context: TitleTemplateContext = {
+			firstMessage: truncatedMessage,
+			cwd: cwd ?? process.cwd(),
+			timestamp: new Date().toISOString(),
+		};
+		try {
+			systemPrompt = renderPromptTemplate(customTemplate, context);
+		} catch (err) {
+			logger.warn("title-generator: failed to render custom title template, using default", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			systemPrompt = TITLE_SYSTEM_PROMPT;
+		}
+	} else {
+		systemPrompt = TITLE_SYSTEM_PROMPT;
+	}
+
 	const request = {
 		model: `${candidate.model.provider}/${candidate.model.id}`,
-		systemPrompt: TITLE_SYSTEM_PROMPT,
+		systemPrompt,
 		userMessage,
 		maxTokens: 30,
 	};
