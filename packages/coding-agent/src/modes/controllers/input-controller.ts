@@ -31,7 +31,7 @@ export class InputController {
 	 * Helper to generate and set session title on first user message.
 	 * Runs in parallel to not block user interaction.
 	 */
-	private generateAndSetSessionTitle(text: string, titleOverride?: string): void {
+	#generateAndSetSessionTitle(text: string, titleOverride?: string): void {
 		const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
 		const shouldGenerateTitle = !hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE;
 		if (!shouldGenerateTitle) return;
@@ -243,7 +243,7 @@ export class InputController {
 				const result = await runner.emitInput(text, inputImages, "interactive");
 				if (result?.handled) {
 					// Generate title for extension commands on first message
-					this.generateAndSetSessionTitle(text);
+					this.#generateAndSetSessionTitle(text);
 					this.ctx.editor.setText("");
 					this.ctx.pendingImages = [];
 					return;
@@ -294,7 +294,7 @@ export class InputController {
 
 						// Generate title for skill on first message (run in parallel)
 						const titleInput = args || skillName || commandName;
-						this.generateAndSetSessionTitle(args, titleInput);
+						this.#generateAndSetSessionTitle(args, titleInput);
 
 						await this.ctx.session.promptCustomMessage(
 							{
@@ -380,7 +380,7 @@ export class InputController {
 			this.ctx.flushPendingBashComponents();
 
 			// Generate title for normal message on first message
-			this.generateAndSetSessionTitle(text);
+			this.#generateAndSetSessionTitle(text);
 
 			if (this.ctx.onInputCallback) {
 				// Include any pending images from clipboard paste
