@@ -1769,9 +1769,16 @@ export const remote = {
 		return splitLines(await runText(cwd, ["remote"], { readOnly: true, signal }));
 	},
 
-	/** Get the URL for a remote. */
+	/** Get the URL for a remote (async). */
 	async url(cwd: string, name: string, signal?: AbortSignal): Promise<string | undefined> {
 		return trimScalar(await tryText(cwd, ["remote", "get-url", name], { readOnly: true, signal }));
+	},
+
+	/** Get the URL for a remote (sync). */
+	urlSync(cwd: string, name: string): string | undefined {
+		const result = gitSpawnSyncText(cwd, ["remote", "get-url", name]);
+		if (result.exitCode !== 0) return undefined;
+		return result.stdout || undefined;
 	},
 
 	/**

@@ -9,6 +9,7 @@
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import { ToolError } from "../tools/tool-errors";
+import * as git from "./git";
 
 export type GhHost = "github" | "forgejo" | "gitea";
 
@@ -70,13 +71,7 @@ export async function resolveForgejoRepoFromRemote(cwd: string): Promise<string 
  */
 function readOriginRemoteUrl(cwd?: string): string | undefined {
 	try {
-		const result = Bun.spawnSync(["git", "remote", "get-url", "origin"], {
-			cwd: cwd ?? process.cwd(),
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		if (result.exitCode !== 0) return undefined;
-		const value = result.stdout.toString().trim();
-		return value || undefined;
+		return git.remote.urlSync(cwd ?? process.cwd(), "origin");
 	} catch (err) {
 		logger.debug("forgejo host detection: git remote lookup failed", { err: String(err) });
 		return undefined;
@@ -85,14 +80,8 @@ function readOriginRemoteUrl(cwd?: string): string | undefined {
 
 async function readOriginRemoteUrlAsync(cwd: string): Promise<string | undefined> {
 	try {
-		const child = Bun.spawn(["git", "remote", "get-url", "origin"], {
-			cwd,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		const exitCode = await child.exited;
-		if (exitCode !== 0) return undefined;
-		const value = (await new Response(child.stdout).text()).trim();
-		return value || undefined;
+		const url = await git.remote.url(cwd, "origin");
+		return url;
 	} catch (err) {
 		if (err instanceof Error && err.name === "AbortError") throw err;
 		logger.debug("forgejo repo resolution: git remote lookup failed", { err: String(err) });

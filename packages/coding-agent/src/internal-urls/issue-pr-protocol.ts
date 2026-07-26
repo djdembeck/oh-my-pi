@@ -21,6 +21,7 @@
 import type { Settings } from "../config/settings";
 import { AgentRegistry } from "../registry/agent-registry";
 import {
+	type ForgejoListItem,
 	type ForgejoPrFileApi,
 	fetchForgejoIssue,
 	fetchForgejoIssueList,
@@ -384,12 +385,21 @@ async function fetchAndRenderForgejoList(
 		author: options.author,
 		label: options.label,
 	};
-	const items =
+	let items: ForgejoListItem[] =
 		scheme === "issue"
 			? await fetchForgejoIssueList(repo, listOptions, context?.signal)
 			: await fetchForgejoPrList(repo, listOptions, context?.signal);
+	// Filter merged PRs post-fetch: Forgejo API accepts state=closed but not
+	// state=merged, so we fetch closed and filter on the merged flag.
+	if (options.state === "merged" && scheme === "pr") {
+		items = items.filter(item => item.merged);
+	}
+	// Apply limit after filtering.
+	const limitedItems = items.slice(0, options.limit);
 	const body =
-		items.length === 0 ? "_No matches._" : items.map(item => formatForgejoListItem(repo, item)).join("\n\n");
+		limitedItems.length === 0
+			? "_No matches._"
+			: limitedItems.map(item => formatForgejoListItem(repo, item, scheme)).join("\n\n");
 	const rendered = renderListMarkdown(scheme, repo, options, body);
 	return {
 		url: url.href,

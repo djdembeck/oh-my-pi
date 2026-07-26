@@ -71,10 +71,35 @@ async function parseErrorPayload(response: Response): Promise<string> {
 	return `HTTP ${response.status}`;
 }
 
+/**
+ * Validate and normalize a repo identifier ("owner/repo").
+ * Rejects path traversal, query strings, fragments, and bare slashes.
+ */
+export function sanitizeRepo(repo: string): string {
+	if (!repo || typeof repo !== "string") throw new Error(`Invalid repo: ${JSON.stringify(repo)}`);
+	const trimmed = repo.trim();
+	if (trimmed.startsWith("/") || trimmed.endsWith("/"))
+		throw new Error(`Repo must not have leading/trailing slash: ${trimmed}`);
+	if (trimmed.includes("..")) throw new Error(`Repo must not contain dot-segments: ${trimmed}`);
+	if (trimmed.includes("#")) throw new Error(`Repo must not contain fragment: ${trimmed}`);
+	if (trimmed.includes("?")) throw new Error(`Repo must not contain query string: ${trimmed}`);
+	return trimmed;
+}
+
+/**
+ * URL-encode only the owner and repo segments within a `/repos/owner/repo/…`
+ * path. Already-percent-encoded octets are not double-encoded.
+ */
+function encodeRepoSegments(_base: string, path: string): string {
+	const m = path.match(/^(\/repos\/)([^/]+)\/([^/]+)(.*)$/);
+	if (!m) return path;
+	return `${m[1]}${encodeURIComponent(m[2])}/${encodeURIComponent(m[3])}${m[4]}`;
+}
+
 function buildUrl(path: string, params?: Record<string, string | number | boolean | undefined>): string {
 	const base = requireBaseUrl();
 	const trimmed = path.startsWith("/") ? path : `/${path}`;
-	const url = new URL(`${base}/api/v1${trimmed}`);
+	const url = new URL(encodeRepoSegments(base, trimmed));
 	if (params) {
 		for (const [key, value] of Object.entries(params)) {
 			if (value === undefined) continue;
@@ -137,7 +162,7 @@ export async function getText(
 	params?: Record<string, string | number | boolean | undefined>,
 ): Promise<string> {
 	const url = buildUrl(path, params);
-	const headers: Record<string, string> = { ...authHeader(), Accept: "application/vnd.github.raw+json" };
+	const headers: Record<string, string> = { ...authHeader() };
 	let response: Response;
 	try {
 		response = await fetch(url, { method: "GET", headers, signal });
@@ -148,6 +173,50 @@ export async function getText(
 	if (!response.ok) {
 		const message = await parseErrorPayload(response);
 		throw new ToolError(`Forgejo GET ${path} failed: ${message}`);
+	}
+	return response.text();
+}
+
+/**
+ * Fetch the raw content of a repository file via the `/raw/` endpoint.
+ * Forgejo/Gitea's `/contents/` endpoint always returns JSON with base64
+ * content — the Accept header is ignored. `/raw/{path}?ref=` returns raw
+ * bytes, which is what we actually want for file reads.
+ */
+export async function getFileContent(
+	repo: string,
+	filePath: string,
+	branch: string | undefined,
+	signal?: AbortSignal,
+): Promise<string> {
+	const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
+	const sanitizedRepo = sanitizeRepo(repo);
+	const path = `/repos/${sanitizedRepo}/raw/${encodedPath}`;
+	const params = branch ? { ref: branch } : undefined;
+	const url = buildUrl(path, params);
+	const headers: Record<string, string> = { ...authHeader() };
+	let response: Response;
+	try {
+		response = await fetch(url, { method: "GET", headers, signal });
+	} catch (err) {
+		if (err instanceof Error && err.name === "AbortError") throw err;
+		throw new ToolError(`Forgejo request failed: GET ${path} — ${err instanceof Error ? err.message : String(err)}`);
+	}
+	if (!response.ok) {
+		const message = await parseErrorPayload(response);
+		throw new ToolError(`Forgejo getFileContent failed: ${message}`);
+	}
+	const ct = response.headers.get("content-type") ?? "";
+	// Binary content guard: reject obvious non-text types
+	if (
+		!ct.includes("text") &&
+		!ct.includes("json") &&
+		!ct.includes("javascript") &&
+		!ct.includes("xml") &&
+		!ct.includes("csv") &&
+		!ct.includes("plain")
+	) {
+		throw new ToolError(`File appears to be binary (Content-Type: ${ct}); use a different tool`);
 	}
 	return response.text();
 }

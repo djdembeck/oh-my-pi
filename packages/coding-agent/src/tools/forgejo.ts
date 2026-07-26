@@ -235,6 +235,7 @@ interface FjRawPr extends FjRawIssue {
 	is_draft?: boolean;
 	draft?: boolean;
 	mergeable?: boolean;
+	merged?: boolean;
 	changes_count?: number;
 	additions?: number;
 	deletions?: number;
@@ -655,7 +656,7 @@ async function resolveRepo(session: ToolSession, explicit: string | undefined): 
 }
 
 function repoPath(repo: string): string {
-	return `/repos/${repo}`;
+	return `/repos/${forgejo.sanitizeRepo(repo)}`;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -724,11 +725,7 @@ export async function fetchForgejoFile(
 	}
 	if (filePath.startsWith("/")) throw new ToolError("path must be repository-relative");
 	const endpointPath = filePath.split("/").map(encodeURIComponent).join("/");
-	const content = await forgejo.getText(
-		`${repoPath(resolved)}/contents/${endpointPath}`,
-		signal,
-		branch ? { ref: branch } : undefined,
-	);
+	const content = await forgejo.getFileContent(resolved, filePath, branch, signal);
 	const sourceUrl = `${forgejo.resolveBaseUrl() ?? ""}/${resolved}/src/${encodeURIComponent(branch ?? "HEAD")}/${endpointPath}`;
 	return {
 		rendered: content,
@@ -839,6 +836,7 @@ export interface ForgejoListItem {
 	updatedAt?: string;
 	url?: string;
 	isDraft?: boolean;
+	merged?: boolean;
 	baseRefName?: string;
 	headRefName?: string;
 }
@@ -873,6 +871,7 @@ export async function fetchForgejoPrList(
 	return filterList(items, options).map(item => ({
 		...mapListItem(item),
 		isDraft: item.is_draft ?? item.draft,
+		merged: item.merged,
 		baseRefName: item.base?.ref,
 		headRefName: item.head?.ref,
 	}));
@@ -902,7 +901,7 @@ function mapListItem(item: FjRawIssue): ForgejoListItem {
 	};
 }
 
-export function formatForgejoListItem(repo: string, item: ForgejoListItem): string {
+export function formatForgejoListItem(repo: string, item: ForgejoListItem, scheme: "issue" | "pr" = "issue"): string {
 	const number = item.number ?? "?";
 	const title = item.title ?? "(no title)";
 	const state = item.state?.toLowerCase() ?? "?";
@@ -914,7 +913,7 @@ export function formatForgejoListItem(repo: string, item: ForgejoListItem): stri
 		.filter(Boolean)
 		.join(", ");
 	const labelSuffix = labels ? `  labels: ${labels}` : "";
-	const itemUrl = number === "?" ? `issue://${repo}` : `issue://${repo}/${number}`;
+	const itemUrl = number === "?" ? `${scheme}://${repo}` : `${scheme}://${repo}/${number}`;
 	return `- [${state}${draftSuffix}] #${number}  @${author}  ${updated}\n    ${title}${labelSuffix}\n    ${itemUrl}`;
 }
 
@@ -1068,8 +1067,9 @@ export class ForgejoTool implements AgentTool<typeof forgejoSchema, ForgejoToolD
 					const identifier = normalizeOptionalString(params.issue);
 					if (!identifier) throw new ToolError("issue must not be empty");
 					const state = params.op === "issue_close" ? "closed" : "open";
-					const number = parseNumber(identifier);
-					const repo = await resolveRepo(this.session, params.repo);
+					const urlParse = parseIssueUrl(identifier);
+					const repo = await resolveRepo(this.session, urlParse.repo ?? params.repo);
+					const number = urlParse.issueNumber ?? parseNumber(identifier);
 					const raw = await forgejo.patch<FjRawIssue>(`${repoPath(repo)}/issues/${number}`, { state }, signal);
 					const data = mapIssue(raw);
 					data.number = number;
@@ -1080,8 +1080,9 @@ export class ForgejoTool implements AgentTool<typeof forgejoSchema, ForgejoToolD
 					if (!identifier) throw new ToolError("issue must not be empty");
 					const body = normalizeOptionalString(params.comment);
 					if (!body) throw new ToolError("comment must not be empty");
-					const number = parseNumber(identifier);
-					const repo = await resolveRepo(this.session, params.repo);
+					const urlParse = parseIssueUrl(identifier);
+					const repo = await resolveRepo(this.session, urlParse.repo ?? params.repo);
+					const number = urlParse.issueNumber ?? parseNumber(identifier);
 					await forgejo.post(`${repoPath(repo)}/issues/${number}/comments`, { body }, signal);
 					return buildTextResult(`Commented on issue #${number} in ${repo}.`);
 				}
@@ -1109,7 +1110,7 @@ function formatListOutput(
 ): string {
 	const header = `# ${scheme === "issue" ? "Issues" : "Pull Requests"} in ${repo} (${listOptions(params).state}, up to ${listOptions(params).limit})`;
 	const body =
-		items.length === 0 ? "_No matches._" : items.map(item => formatForgejoListItem(repo, item)).join("\n\n");
+		items.length === 0 ? "_No matches._" : items.map(item => formatForgejoListItem(repo, item, scheme)).join("\n\n");
 	const footer = `\n\n---\nRead a specific item: \`${scheme}://${repo}/<N>\` (or \`${scheme}://<N>\` for the current repo).`;
 	return `${header}\n\n${body}${footer}`;
 }
