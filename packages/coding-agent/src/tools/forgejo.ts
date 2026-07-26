@@ -729,7 +729,7 @@ export async function fetchForgejoFile(
 		signal,
 		branch ? { ref: branch } : undefined,
 	);
-	const sourceUrl = `${process.env.FORGEJO_URL ?? ""}/${resolved}/src/${encodeURIComponent(branch ?? "HEAD")}/${endpointPath}`;
+	const sourceUrl = `${forgejo.resolveBaseUrl() ?? ""}/${resolved}/src/${encodeURIComponent(branch ?? "HEAD")}/${endpointPath}`;
 	return {
 		rendered: content,
 		sourceUrl,

@@ -530,7 +530,7 @@ async function fetchAndRenderPrDiff(
 	const body =
 		files.length === 0
 			? "_No file changes._"
-			: files.map((f, i) => formatFileLine(i + 1, f, repo, parsed.number)).join("n\n\n");
+			: files.map((f, i) => formatFileLine(i + 1, f, repo, parsed.number)).join("\n\n");
 	const footer = `\n\n---\nRead all: \`pr://${repo}/${parsed.number}/diff/all\`. Each file is also available as \`pr://${repo}/${parsed.number}/diff/<i>\`.`;
 	const content = `${header}\n\n${body}${footer}`;
 	return {
@@ -649,7 +649,11 @@ function findForgejoDiffSectionForFile(unified: string, filename: string): numbe
 	if (idx >= 0) return idx;
 	// Binary/deleted/added sections synthesize `diff --git a/<old> b/<new>`;
 	// fall back to matching either side.
-	return unified.indexOf(`diff --git a/${filename} b/`);
+	const indexedA = unified.indexOf(`diff --git a/${filename} b/`);
+	if (indexedA >= 0) return indexedA;
+	// Renamed files: the filename is the new path, so the a/ side has the old name.
+	// Also try matching the b/ side.
+	return unified.indexOf(`diff --git b/${filename}`);
 }
 
 /** Slice one `diff --git` section from the unified diff, ending at the next section. */

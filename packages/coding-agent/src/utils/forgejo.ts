@@ -27,13 +27,12 @@ function resolveToken(): string | undefined {
 	return undefined;
 }
 
-function resolveBaseUrl(): string | undefined {
+export function resolveBaseUrl(): string | undefined {
 	const raw = process.env.FORGEJO_URL ?? process.env.GITEA_URL;
 	if (!raw) return undefined;
 	return raw.replace(/\/+$/, "");
 }
 
-/** True when both a base URL and a token are visible to this process. */
 export function available(): boolean {
 	return Boolean(resolveBaseUrl() && resolveToken());
 }

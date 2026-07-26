@@ -101,9 +101,10 @@ async function readOriginRemoteUrlAsync(cwd: string): Promise<string | undefined
 }
 
 /**
- * Strip ssh/https transport prefix + trailing `.git`, returning `owner/repo`
- * (or `owner/group/repo` for nested paths — callers pass it through to the
- * API verbatim, Forgejo accepts both). Mirrors the three fgh sed expressions.
+ * Strip ssh/https transport prefix + trailing `.git`, returning the full
+ * repo path (`owner/repo` or `owner/group/repo` for nested paths). Callers
+ * pass it through to the API verbatim — Forgejo accepts multi-segment paths.
+ * Mirrors the three fgh sed expressions.
  */
 function stripRemoteToRepoPath(remoteUrl: string): string | undefined {
 	let value = remoteUrl.trim();
@@ -118,11 +119,6 @@ function stripRemoteToRepoPath(remoteUrl: string): string | undefined {
 	value = value.replace(/\.git$/, "");
 	const segments = value.split("/").filter(Boolean);
 	if (segments.length < 2) return undefined;
-	if (segments.length > 2) {
-		// Gitea/Forgejo allow nested org paths (rare). Keep only the last two
-		// segments so the caller always gets owner/repo.
-		return segments.slice(-2).join("/");
-	}
 	return segments.join("/");
 }
 
