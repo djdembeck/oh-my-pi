@@ -1,0 +1,71 @@
+# Forgejo/Gitea Support Plan
+
+## Context
+
+The built-in github tool and issue:///pr:// protocol handlers are hardcoded to GitHub CLI (gh) and api.github.com. Forgejo/Gitea instances cannot be used because gh only targets GitHub. Forgejo exposes a compatible REST API at /api/v1 with the same JSON shapes for issues/pulls. The constraint is no Bash dependency — we want a native TypeScript implementation using Bun.fetch.
+
+## Approach
+
+Create three new files, keep existing GitHub files untouched:
+
+### 1. `packages/coding-agent/src/utils/forgejo.ts` — Native HTTP Client
+
+Exports a `forgejo` namespace with `available()`, `run()`, `json()`, `text()` using `Bun.fetch`. Mirrors `github` namespace shape in `git.ts`.
+
+- Auth: reads `FORGEJO_TOKEN`/`FGH_TOKEN`/`FORGEJO_ISSUE_TOKEN` (first set wins).
+- Base URL: `{FORGEJO_URL}/api/v1`.
+- Auth header: `Authorization: token <token>` (Forgejo format).
+- Pagination: Forgejo uses `page`/`limit`, loop until empty response.
+- Label IDs are integers; resolves names to IDs before issue creation.
+
+### 2. `packages/coding-agent/src/utils/forgejo-helpers.ts` — Host Detection & Repo Resolution
+
+Exports:
+- `resolveGitHost(cwd?: string): GhHost` — detect host. Order: FORGEJO_URL env, GITEA_URL env, git remote hostname, default "github".
+- `resolveForgejoRepo(cwd, signal)` — parse owner/repo from git remote URL.
+- `isForgejoHost(cwd?)` — convenience.
+- `GhHost` type: `"github" | "forgejo" | "gitea"`.
+
+### 3. `packages/coding-agent/src/tools/forgejo.ts` — Forgejo Tool
+
+Implements `AgentTool` with same schema shape as `githubSchema` but restricted to Forgejo ops. Routes to `git.forgejo.*` HTTP calls.
+
+Supported: `repo_view`, `file_read`, `issue_view`, `issue_list`, `pr_view`, `pr_list`, `pr_diff`, `issue_close`, `issue_open`, `issue_comment`, `pr_reviews`, `pr_review_comments`.
+
+Unsupported (return ToolError): `pr_checkout`, `pr_push`, `pr_create`, `search_*`, `run_watch`, `run_artifacts`, `run_jobs`.
+
+Diff reconstruction copies `buildSyntheticDiffSection` from `gh.ts`. URL patterns generalized to accept any hostname.
+
+### 4. Tool Registration
+
+`ForgejoTool.createIf()` checks `forgejo.available()` (FORGEJO_URL env). Registered alongside `GithubTool` in tool discovery.
+
+### 5. Protocol Handler Updates
+
+`issue-pr-protocol.ts`: branch on host for fetch calls, generalize URL patterns to accept non-github.com hostnames, update doc comment.
+
+### 6. Cache Auth Key
+
+Extend `github-cache.ts` to check FORGEJO_TOKEN/GITEA_TOKEN, include host type in cache key.
+
+## Critical Files
+
+1. `packages/coding-agent/src/utils/git.ts` lines 2331-2421 — github namespace to mirror
+2. `packages/coding-agent/src/tools/gh.ts` lines 244-246 (URL patterns), 697 (API prefix), 1733-1775 (repo resolution), 1931-1970 (review comments fetch), 2600-2630 (fresh fetch functions), 2510-2560 (repo/file execute)
+3. `../forgejo-cli/fgh` — reference implementation, lines 30-50 (repo detection), 60-130 (issues), 230-290 (PRs)
+4. `packages/coding-agent/src/internal-urls/issue-pr-protocol.ts` — lines 1-30 (doc), 288-330 (fetchAndRenderList), 399-430 (fetchAndRenderPrDiff), 490-600 (handlers)
+5. `packages/coding-agent/src/tools/github-cache.ts` lines 200-240 (auth key resolution)
+
+## Verification
+
+- `bun check` in packages/coding-agent/ passes
+- ForgejoTool.createIf() returns tool when FORGEJO_URL set
+- GithubTool.createIf() unchanged for github.com repos
+- No gh imports in new forgejo files
+
+## Assumptions
+
+- Forgejo/Gitea API shapes match GitHub's close enough for same field lists/formatters
+- `buildSyntheticDiffSection` pattern works for Forgejo's per-file API
+- Actions ops disabled entirely for Forgejo (different API structure)
+- No PR checkout/push for Forgejo (GitHub-CLI feature only)

@@ -1,10 +1,11 @@
 /**
  * Protocol handlers for `issue://` and `pr://`.
  *
- * Both single-item reads route through the SQLite-backed `github-cache`,
- * sharing rendered markdown across sessions. Root and repo-scoped reads
- * (`issue://`, `pr://owner/repo`) issue a live `gh issue list` / `gh pr list`
- * for browsing.
+ * GitHub-hosted checkouts route through the SQLite-backed `github-cache`,
+ * sharing rendered markdown across sessions. Forgejo/Gitea-hosted checkouts
+ * branch to a direct REST client (`../utils/forgejo`) — no cache layer yet —
+ * and reuse the same formatter stack. Root and repo-scoped reads
+ * (`issue://`, `pr://owner/repo`) issue a live listing for browsing.
  *
  * URL shapes:
  * - `issue://` / `pr://` — list recent items in the caller's default repo.
@@ -15,10 +16,19 @@
  *   item.
  * - `issue://owner/repo/123?comments=0` — single item, comments suppressed.
  * - `issue://owner/repo?state=closed&limit=20` — list options pass through to
- *   `gh`.
+ *   the underlying API.
  */
 import type { Settings } from "../config/settings";
 import { AgentRegistry } from "../registry/agent-registry";
+import {
+	type ForgejoPrFileApi,
+	fetchForgejoIssue,
+	fetchForgejoIssueList,
+	fetchForgejoPr,
+	fetchForgejoPrDiff,
+	fetchForgejoPrList,
+	formatForgejoListItem,
+} from "../tools/forgejo";
 import {
 	getOrFetchIssue,
 	getOrFetchPr,
@@ -29,6 +39,7 @@ import {
 	resolveDefaultRepoMemoized,
 } from "../tools/gh";
 import { type CacheStatus, formatFreshnessNote } from "../tools/github-cache";
+import { resolveForgejoRepoFromRemote, resolveGitHost } from "../utils/forgejo-helpers";
 import * as git from "../utils/git";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
@@ -241,6 +252,14 @@ async function resolveListRepo(
 ): Promise<string> {
 	if (parsedRepo) return parsedRepo;
 	const cwd = resolveCwd(context);
+	const host = resolveGitHost(cwd);
+	if (host !== "github") {
+		const fromRemote = await resolveForgejoRepoFromRemote(cwd);
+		if (fromRemote) return fromRemote;
+		throw new Error(
+			`${scheme}:// could not resolve a default repo from the current checkout's \`origin\` remote.\nUse ${scheme}://<owner>/<repo> instead.`,
+		);
+	}
 	try {
 		return await resolveDefaultRepoMemoized(cwd, context?.signal);
 	} catch (err) {
@@ -293,6 +312,10 @@ async function fetchAndRenderList(
 ): Promise<InternalResource> {
 	const repo = await resolveListRepo(scheme, options.repo, context);
 	const cwd = resolveCwd(context);
+	const host = resolveGitHost(cwd);
+	if (host !== "github") {
+		return fetchAndRenderForgejoList(scheme, repo, options, url, context);
+	}
 	const fields =
 		scheme === "issue"
 			? ["number", "title", "state", "author", "labels", "createdAt", "updatedAt", "url"]
@@ -332,14 +355,12 @@ async function fetchAndRenderList(
 			: await git.github.json<Array<PrListItem>>(cwd, args, context?.signal, {
 					repoProvided: true,
 				});
-	const header =
-		scheme === "issue"
-			? `# Issues in ${repo} (${options.state}, up to ${options.limit})`
-			: `# Pull Requests in ${repo} (${options.state}, up to ${options.limit})`;
-	const body =
-		items.length === 0 ? "_No matches._" : items.map(item => formatListItem(scheme, repo, item)).join("\n\n");
-	const footer = `\n\n---\nRead a specific item: \`${scheme}://${repo}/<N>\` (or \`${scheme}://<N>\` for the current repo).`;
-	const rendered = `${header}\n\n${body}${footer}`;
+	const rendered = renderListMarkdown(
+		scheme,
+		repo,
+		options,
+		items.length === 0 ? "_No matches._" : items.map(item => formatListItem(scheme, repo, item)).join("\n\n"),
+	);
 
 	return {
 		url: url.href,
@@ -348,6 +369,44 @@ async function fetchAndRenderList(
 		size: Buffer.byteLength(rendered, "utf-8"),
 		notes: [`Live listing for ${repo}`],
 	};
+}
+
+async function fetchAndRenderForgejoList(
+	scheme: Scheme,
+	repo: string,
+	options: ParsedList,
+	url: InternalUrl,
+	context: ResolveContext | undefined,
+): Promise<InternalResource> {
+	const listOptions = {
+		state: options.state === "merged" ? "closed" : options.state,
+		limit: options.limit,
+		author: options.author,
+		label: options.label,
+	};
+	const items =
+		scheme === "issue"
+			? await fetchForgejoIssueList(repo, listOptions, context?.signal)
+			: await fetchForgejoPrList(repo, listOptions, context?.signal);
+	const body =
+		items.length === 0 ? "_No matches._" : items.map(item => formatForgejoListItem(repo, item)).join("\n\n");
+	const rendered = renderListMarkdown(scheme, repo, options, body);
+	return {
+		url: url.href,
+		content: rendered,
+		contentType: "text/markdown",
+		size: Buffer.byteLength(rendered, "utf-8"),
+		notes: [`Live Forgejo listing for ${repo}`],
+	};
+}
+
+function renderListMarkdown(scheme: Scheme, repo: string, options: ParsedList, body: string): string {
+	const header =
+		scheme === "issue"
+			? `# Issues in ${repo} (${options.state}, up to ${options.limit})`
+			: `# Pull Requests in ${repo} (${options.state}, up to ${options.limit})`;
+	const footer = `\n\n---\nRead a specific item: \`${scheme}://${repo}/<N>\` (or \`${scheme}://<N>\` for the current repo).`;
+	return `${header}\n\n${body}${footer}`;
 }
 
 interface BuildSingleArgs {
@@ -402,6 +461,10 @@ async function fetchAndRenderPrDiff(
 	context: ResolveContext | undefined,
 ): Promise<InternalResource> {
 	const cwd = resolveCwd(context);
+	const host = resolveGitHost(cwd);
+	if (host !== "github") {
+		return fetchAndRenderForgejoPrDiff(url, parsed, cwd, context);
+	}
 	let repo = parsed.repo;
 	if (!repo) {
 		try {
@@ -467,7 +530,7 @@ async function fetchAndRenderPrDiff(
 	const body =
 		files.length === 0
 			? "_No file changes._"
-			: files.map((f, i) => formatFileLine(i + 1, f, repo, parsed.number)).join("\n\n");
+			: files.map((f, i) => formatFileLine(i + 1, f, repo, parsed.number)).join("n\n\n");
 	const footer = `\n\n---\nRead all: \`pr://${repo}/${parsed.number}/diff/all\`. Each file is also available as \`pr://${repo}/${parsed.number}/diff/<i>\`.`;
 	const content = `${header}\n\n${body}${footer}`;
 	return {
@@ -477,6 +540,124 @@ async function fetchAndRenderPrDiff(
 		size: Buffer.byteLength(content, "utf-8"),
 		notes: [freshness, `File listing for pr://${repo}/${parsed.number}`],
 	};
+}
+
+/**
+ * Forgejo path for PR diff rendering. Forgejo has no aggregate `pr diff`
+ * endpoint; the unified diff is reconstructed from the per-file API via the
+ * same `buildSyntheticDiffSection` helper the GitHub tool uses. Slices by
+ * splitting the reconstructed text on `\ndiff --git ` boundaries.
+ */
+async function fetchAndRenderForgejoPrDiff(
+	url: InternalUrl,
+	parsed: ParsedPrDiff,
+	cwd: string,
+	context: ResolveContext | undefined,
+): Promise<InternalResource> {
+	let repo = parsed.repo;
+	if (!repo) {
+		repo = await resolveForgejoRepoFromRemote(cwd);
+		if (!repo) {
+			throw new Error(
+				`pr://${parsed.number}/diff could not resolve a Forgejo repo from the current checkout's \`origin\` remote.\nUse pr://<owner>/<repo>/${parsed.number}/diff.`,
+			);
+		}
+	}
+	const lookup = await fetchForgejoPrDiff(cwd, repo, parsed.number, context?.signal);
+	const files = lookup.payload.files;
+	const freshness = formatFreshnessNote("miss", lookup.fetchedAt);
+
+	if (parsed.mode === "all") {
+		const content = lookup.payload.unified;
+		return {
+			url: url.href,
+			content,
+			contentType: "text/plain",
+			size: Buffer.byteLength(content, "utf-8"),
+			notes: [
+				freshness,
+				`Full diff for pr://${repo}/${parsed.number} (${files.length} file${files.length === 1 ? "" : "s"})`,
+			],
+		};
+	}
+
+	if (parsed.mode === "slice") {
+		const index = parsed.index ?? 0;
+		if (index < 1 || index > files.length) {
+			throw new Error(
+				`pr://${repo}/${parsed.number}/diff/${index} is out of range; PR has ${files.length} file${files.length === 1 ? "" : "s"}. Use pr://${repo}/${parsed.number}/diff to list available indices.`,
+			);
+		}
+		const file = files[index - 1];
+		if (!file?.filename) {
+			throw new Error(`pr://${repo}/${parsed.number}/diff/${index} resolved to a missing slice.`);
+		}
+		const filePath = file.filename;
+		const sectionIndex = findForgejoDiffSectionForFile(lookup.payload.unified, filePath);
+		if (sectionIndex < 0) {
+			throw new Error(
+				`pr://${repo}/${parsed.number}/diff/${index} (${filePath}) was not found in the reconstructed diff.`,
+			);
+		}
+		const content = sliceForgejoDiffSection(lookup.payload.unified, sectionIndex);
+		return {
+			url: url.href,
+			content,
+			contentType: "text/plain",
+			size: Buffer.byteLength(content, "utf-8"),
+			notes: [
+				freshness,
+				`Showing file ${index}/${files.length}: ${filePath}`,
+				`Read all: pr://${repo}/${parsed.number}/diff/all`,
+			],
+		};
+	}
+
+	// mode === "list"
+	const header = `# Pull Request Diff: ${repo}#${parsed.number} (${files.length} file${files.length === 1 ? "" : "s"})`;
+	const lines = files
+		.map((f, i) => forgejoFileLine(i + 1, f, repo, parsed.number))
+		.filter((line): line is string => Boolean(line));
+	const body = lines.length === 0 ? "_No file changes._" : lines.join("\n\n");
+	const footer = `\n\n---\nRead all: \`pr://${repo}/${parsed.number}/diff/all\`. Each file is also available as \`pr://${repo}/${parsed.number}/diff/<i>\`.`;
+	const content = `${header}\n\n${body}${footer}`;
+	return {
+		url: url.href,
+		content,
+		contentType: "text/markdown",
+		size: Buffer.byteLength(content, "utf-8"),
+		notes: [freshness, `File listing for pr://${repo}/${parsed.number}`],
+	};
+}
+
+function forgejoFileLine(idx: number, file: ForgejoPrFileApi, repo: string, prNumber: number): string | undefined {
+	const path = file.filename;
+	if (!path) return undefined;
+	const additions = file.additions ?? 0;
+	const deletions = file.deletions ?? 0;
+	const status = file.status ?? "modified";
+	const rename = file.previous_filename ? `  (renamed from ${file.previous_filename})` : "";
+	const binary = !file.patch;
+	const stats = binary ? "(binary or too large)" : `+${additions} -${deletions}`;
+	return `${idx}. ${path}  ${stats}  [${status}]${rename}\n   pr://${repo}/${prNumber}/diff/${idx}`;
+}
+
+/** Locate the byte offset of the `diff --git` section matching `filename`. */
+function findForgejoDiffSectionForFile(unified: string, filename: string): number {
+	const needle = `diff --git a/${filename} `;
+	const idx = unified.indexOf(needle);
+	if (idx >= 0) return idx;
+	// Binary/deleted/added sections synthesize `diff --git a/<old> b/<new>`;
+	// fall back to matching either side.
+	return unified.indexOf(`diff --git a/${filename} b/`);
+}
+
+/** Slice one `diff --git` section from the unified diff, ending at the next section. */
+function sliceForgejoDiffSection(unified: string, start: number): string {
+	if (start < 0) return "";
+	const nextSection = unified.indexOf("\ndiff --git ", start + 1);
+	const end = nextSection < 0 ? unified.length : nextSection + 1;
+	return unified.slice(start, end);
 }
 
 /**
@@ -504,9 +685,28 @@ export class IssueProtocolHandler implements ProtocolHandler {
 		if (parsed.kind !== "single") {
 			throw new Error(`Invalid issue:// URL: unexpected variant '${parsed.kind}'`);
 		}
+		const cwd = resolveCwd(context);
+		const host = resolveGitHost(cwd);
 		try {
+			if (host !== "github") {
+				const lookup = await fetchForgejoIssue(
+					cwd,
+					parsed.repo,
+					String(parsed.number),
+					parsed.comments,
+					context?.signal,
+				);
+				return buildSingleResource({
+					url,
+					scheme: "issue",
+					parsed,
+					rendered: lookup.rendered,
+					status: lookup.status,
+					fetchedAt: lookup.fetchedAt,
+				});
+			}
 			const lookup = await getOrFetchIssue({
-				cwd: resolveCwd(context),
+				cwd,
 				repo: parsed.repo,
 				issue: String(parsed.number),
 				includeComments: parsed.comments,
@@ -557,18 +757,40 @@ export class PrProtocolHandler implements ProtocolHandler {
 			}
 		}
 		const cwd = resolveCwd(context);
+		const host = resolveGitHost(cwd);
 		let repo = parsed.repo;
 		if (!repo) {
-			try {
-				repo = await resolveDefaultRepoMemoized(cwd, context?.signal);
-			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
+			if (host !== "github") {
+				repo = await resolveForgejoRepoFromRemote(cwd);
+			} else {
+				try {
+					repo = await resolveDefaultRepoMemoized(cwd, context?.signal);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					throw new Error(
+						`pr://${parsed.number} could not resolve a default repo from the current session: ${message}\nUse pr://<owner>/<repo>/${parsed.number}.`,
+					);
+				}
+			}
+			if (!repo) {
 				throw new Error(
-					`pr://${parsed.number} could not resolve a default repo from the current session: ${message}\nUse pr://<owner>/<repo>/${parsed.number}.`,
+					`pr://${parsed.number} could not resolve a repo from the current checkout's \`origin\` remote.\nUse pr://<owner>/<repo>/${parsed.number}.`,
 				);
 			}
 		}
 		try {
+			if (host !== "github") {
+				const lookup = await fetchForgejoPr(cwd, repo, String(parsed.number), parsed.comments, context?.signal);
+				return buildSingleResource({
+					url,
+					scheme: "pr",
+					parsed,
+					rendered: lookup.rendered,
+					status: lookup.status,
+					fetchedAt: lookup.fetchedAt,
+					repo,
+				});
+			}
 			const lookup = await getOrFetchPr({
 				cwd,
 				repo,

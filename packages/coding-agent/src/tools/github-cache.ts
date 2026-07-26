@@ -189,7 +189,13 @@ interface AuthKeyMemoEntry {
 	hostsMtimeMs: number;
 	value: string | undefined;
 }
-const AUTH_KEY_TOKEN_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+const AUTH_KEY_TOKEN_ENV_VARS = [
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GH_ENTERPRISE_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"FORGEJO_TOKEN",
+];
 const authKeyMemo = new Map<string, AuthKeyMemoEntry>();
 
 /**

@@ -45,6 +45,7 @@ import { ComputerTool } from "./computer";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
+import { ForgejoTool } from "./forgejo";
 import { GithubTool } from "./gh";
 import { GlobTool } from "./glob";
 import { GrepTool } from "./grep";
@@ -397,6 +398,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	debug: DebugTool.createIf,
 	eval: s => new EvalTool(s),
 	github: GithubTool.createIf,
+	forgejo: ForgejoTool.createIf,
 	glob: s => new GlobTool(s, { rootPathAlias: true }),
 	grep: s => new GrepTool(s),
 	lsp: LspTool.createIf,
