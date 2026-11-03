@@ -1,0 +1,6 @@
+{
+  "djdembeck/robomp-double-reply": "e369e88e8d486e27035b0312188fed97acaff180",
+  "djdembeck/robomp-pr-review-skip-bots": "e2d74ee06bbbb08edb8ab13fa9f62b768493e758",
+  "feat/forgejo-platform-support": "169cc5b225bd4526b403d5e078cba7fde14094cc",
+  "feat/robomp-pr-review-status-checks": "c1c3b6be89ebe8800574983d52205246e1c2b154"
+}
