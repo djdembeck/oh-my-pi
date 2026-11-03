@@ -6,7 +6,7 @@ Review comment on PR you opened.
 
 {{thread}}
 
----
+{{coalesced_section}}
 
 ## @{{comment.author}} — {{comment_ref}}
 
@@ -14,8 +14,9 @@ Review comment on PR you opened.
 
 ---
 
-- MUST read the diff (and the cited line range when given) before acting.
+- MUST read diff context around cited line range before acting.
 - Comment may be a reviewer-bot summary (e.g. a Mira walkthrough); treat each concrete finding in it as actionable.
 - Address comment; push follow-up commit on `{{workspace.branch}}`.
 - Reply: single `gh_post_comment` summarizing changes, one line per concrete fix.
 - Clarification, not change? Answer with `gh_post_comment`; NEVER touch code.
+- Point already resolved on `{{workspace.branch}}` or already answered in the prior conversation or this session: stay silent — no commit, no comment; NEVER a second "already resolved" reply.
