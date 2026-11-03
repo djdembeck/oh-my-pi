@@ -965,7 +965,9 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         description = description_raw if isinstance(description_raw, str) else ""
         target_url_raw = data.get("target_url")
         target_url = target_url_raw if isinstance(target_url_raw, str) and target_url_raw else None
-        github: GitHubClient = request.app.state.github
+        # Route by the signed ?platform= query: a Forgejo review must post its
+        # status with the Forgejo token/base URL, not the GitHub client.
+        github: GitHubClient = _github_client_for(request)
         try:
             await github.create_commit_status(
                 repo, sha, state=state, context=context, description=description, target_url=target_url

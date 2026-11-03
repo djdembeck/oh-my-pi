@@ -761,6 +761,40 @@ async def test_commit_status_forwards_to_github(proxy_settings: Settings) -> Non
     }
 
 
+async def test_commit_status_uses_forgejo_client_for_platform(proxy_settings: Settings) -> None:
+    """A ?platform=forgejo request must post through the Forgejo client/token."""
+    captured: dict[str, httpx.Request] = {}
+
+    def github(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"github client must not be used: {req.url}")
+
+    def forgejo(req: httpx.Request) -> httpx.Response:
+        captured["req"] = req
+        return httpx.Response(201, json={})
+
+    app = _build_app(proxy_settings, github)
+    app.state.forgejo_github = GitHubClient(
+        "forgejo-token",
+        transport=httpx.MockTransport(forgejo),
+        base_url="https://git.example/api/v1",
+        platform="forgejo",
+    )
+    body = (
+        b'{"repo":"octo/widget","sha":"abc123","state":"pending","context":"robomp/pr-review","description":"Queued"}'
+    )
+    target = "/gh/v1/commit_status?platform=forgejo"
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            target,
+            content=body,
+            headers={**_signed("POST", target, body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 200
+    req = captured["req"]
+    assert req.url.host == "git.example"
+    assert req.url.path == "/api/v1/repos/octo/widget/statuses/abc123"
+
+
 async def test_commit_status_rejects_bad_state(proxy_settings: Settings) -> None:
     app = _build_app(proxy_settings, lambda req: httpx.Response(201, json={}))
     body = b'{"repo":"octo/widget","sha":"abc123","state":"weird","context":"robomp/pr-review"}'
