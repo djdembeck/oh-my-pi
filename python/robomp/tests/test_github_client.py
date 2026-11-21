@@ -1633,3 +1633,48 @@ def test_github_review_comments_regression_pins() -> None:
     assert requested == ["/repos/o/r/pulls/comments/10925"]
     assert rc.id == 10925
     assert rc.line == 655
+
+
+def test_create_commit_status_posts_state_and_context() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["req"] = request
+        return httpx.Response(201, json={})
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    assert (
+        _run_async(
+            client.create_commit_status(
+                "octo/widget", "deadbeef", state="pending", context="robomp/pr-review", description="hi"
+            )
+        )
+        is None
+    )
+    req = captured["req"]
+    assert req.method == "POST"
+    assert req.url.path == "/repos/octo/widget/statuses/deadbeef"
+    body = json.loads(req.content)
+    assert body["state"] == "pending"
+    assert body["context"] == "robomp/pr-review"
+    assert body["description"] == "hi"
+    assert "target_url" not in body
+
+
+def test_create_commit_status_truncates_description() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(201, json={})
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    long_description = "x" * 200
+    _run_async(
+        client.create_commit_status(
+            "octo/widget", "deadbeef", state="pending", context="robomp/pr-review", description=long_description
+        )
+    )
+    body = captured["body"]
+    assert len(body["description"]) == 140
+    assert body["description"] == long_description[:140]
