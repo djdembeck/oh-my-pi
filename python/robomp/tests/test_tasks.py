@@ -3,10 +3,19 @@ import logging
 import threading
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
-from robomp import tasks
-from robomp.github_client import GitHubError, IssueInfo, PullRequestReviewInfo, RepoInfo, ReviewCommentInfo
+from robomp import pr_status, tasks, worker
+from robomp.db import COALESCED_ERROR, Database, coalesced_error_for
+from robomp.github_client import (
+    GitHubError,
+    IssueInfo,
+    PullRequestInfo,
+    PullRequestReviewInfo,
+    RepoInfo,
+    ReviewCommentInfo,
+)
 
 
 async def test_triage_issue_keeps_event_loop_live_while_workspace_setup_blocks(db, settings, monkeypatch, tmp_path):
@@ -237,103 +246,752 @@ async def test_triage_issue_reopen_tears_down_finalized_workspace(db, settings, 
     assert row.state == "reproducing"
 
 
-async def test_handle_review_forgejo_empty_body_fetches_comment_text_by_id(db, settings, monkeypatch) -> None:
-    """Forgejo #7935: a `pull_request_review_comment` payload with empty `body`
-    must pull the real text via `get_review_comment(id)` before handing off."""
-    key = tasks.issue_key("octo/widget", 9)
+async def test_handle_review_passes_full_thread_to_run_task(db, settings, monkeypatch, tmp_path):
+    """The inline-triggered run MUST receive the full review thread, not just the single comment."""
     db.upsert_issue(
-        key=key,
+        key="octo/widget#5",
         repo="octo/widget",
-        number=9,
-        state="opened",
-        branch="farm/abc/review",
-        session_dir="/tmp/sess",
-        pr_number=99,
+        number=5,
+        state="open",
+        branch="farm/abc/5",
+        pr_number=7,
     )
-    row = db.get_issue(key)
-    assert row is not None
 
-    fetched_calls: list[tuple[str, int]] = []
+    repo = RepoInfo(
+        full_name="octo/widget",
+        default_branch="main",
+        clone_url="https://x/octo/widget.git",
+        private=False,
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=5,
+        title="bug",
+        body="b",
+        state="open",
+        author="alice",
+        labels=(),
+        is_pull_request=False,
+    )
 
-    class _FakeGH:
-        async def get_repo(self, repo):
-            return RepoInfo(
-                full_name=repo,
-                default_branch="main",
-                clone_url="https://x/octo/widget.git",
-                private=False,
-            )
+    async def _get_repo(_r):
+        return repo
 
-        async def get_issue(self, repo, number):
-            return IssueInfo(
-                repo=repo,
-                number=number,
-                title="t",
-                body="b",
-                state="open",
-                author="a",
-                labels=(),
-                is_pull_request=False,
-            )
+    async def _get_issue(_r, _n):
+        return issue
 
-        async def get_issue_comment(self, repo, comment_id):
-            # A review id is not an issue comment on this path: 404 -> fall back
-            # to the review walk below.
-            raise GitHubError(404, "not an issue comment")
+    async def _list_comments(_r, _n):
+        return []
 
-        async def get_review_comment(self, repo, comment_id, pr_number=None):
-            fetched_calls.append((repo, int(comment_id)))
-            return ReviewCommentInfo(
-                id=int(comment_id),
-                author="alice",
-                body="the real comment text",
-                path="src/app.py",
-                line=5,
-                created_at="2026-01-01T00:00:00Z",
-            )
+    async def _list_review_comments(_r, _n):
+        return [
+            SimpleNamespace(
+                author="coderabbit", body="leak at 42", path="src/foo.py", line=42, created_at="2026-05-02T10:00:00Z"
+            ),
+        ]
 
-        async def get_pr_review(self, repo, review_id, *, pr_number=None):
-            raise AssertionError("review summary must not be fetched once the walk resolves")
+    async def _list_pr_reviews(_r, _n):
+        return []
+
+    github = SimpleNamespace(
+        get_repo=_get_repo,
+        get_issue=_get_issue,
+        list_comments=_list_comments,
+        list_review_comments=_list_review_comments,
+        list_pr_reviews=_list_pr_reviews,
+    )
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kwargs: SimpleNamespace(branch="farm/abc/5", session_dir=str(tmp_path / "sess")),
+    )
 
     captured: dict[str, object] = {}
 
-    async def fake_run_task(*, task_kind, inputs, pr_number, review_payload, **_kwargs):
-        del inputs, pr_number
-        captured["kind"] = task_kind
-        captured["review_payload"] = review_payload
+    async def _capturing_run_task(**kwargs):
+        captured.update(kwargs)
 
-    async def fake_resolve(**_kwargs):
-        return (row, None)
+    monkeypatch.setattr(tasks, "run_task", _capturing_run_task)
 
-    async def fake_workspace_op(func, **_kwargs):
-        del func
-        return SimpleNamespace(branch="farm/abc/review", session_dir="/tmp/sess")
-
-    monkeypatch.setattr(tasks, "run_task", fake_run_task)
-    monkeypatch.setattr(tasks, "_resolve_issue_row_for_pr", fake_resolve)
-    monkeypatch.setattr(tasks, "_run_workspace_op", fake_workspace_op)
+    payload = {
+        "pull_request": {"number": 7},
+        "repository": {"full_name": "octo/widget"},
+        "comment": {
+            "user": {"login": "coderabbit"},
+            "body": "leak at 42",
+            "path": "src/foo.py",
+            "line": 42,
+        },
+    }
 
     await tasks.handle_review(
         settings=settings,
         db=db,
-        github=_FakeGH(),
-        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **k: None),
-        git_transport=None,
-        payload={
-            "pull_request": {"number": 99},
-            "repository": {"full_name": "octo/widget"},
-            "review": {"content": "", "id": 42},  # forgejo empty-body review
-            "sender": {"login": "alice"},
-        },
-        delivery_id="d1",
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=payload,
+        delivery_id="d-review",
     )
 
-    assert fetched_calls == [("octo/widget", 42)]
-    assert captured["kind"] == "handle_review"
-    payload = captured["review_payload"]  # type: ignore[index]
-    assert payload["body"] == "the real comment text"
-    assert payload["path"] == "src/app.py"
-    assert payload["line"] == 5
+    thread = captured.get("thread")
+    assert isinstance(thread, tuple) and thread, "handle_review must pass the fetched thread to run_task"
+    review_messages = [m for m in thread if getattr(m, "kind", "") == "review_comment"]
+    assert len(review_messages) == 1
+    assert review_messages[0].body == "leak at 42"
+    assert review_messages[0].path == "src/foo.py"
+
+
+def _coalesced_review_env(db, settings, tmp_path, monkeypatch, *, list_review_comments):
+    """Shared handle_review fixture for the coalesced-sibling prompt tests."""
+    db.upsert_issue(
+        key="octo/widget#5",
+        repo="octo/widget",
+        number=5,
+        state="open",
+        branch="farm/abc/5",
+        pr_number=7,
+    )
+    repo = RepoInfo(
+        full_name="octo/widget",
+        default_branch="main",
+        clone_url="https://x/octo/widget.git",
+        private=False,
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=5,
+        title="bug",
+        body="b",
+        state="open",
+        author="alice",
+        labels=(),
+        is_pull_request=False,
+    )
+
+    async def _get_repo(_r):
+        return repo
+
+    async def _get_issue(_r, _n):
+        return issue
+
+    async def _list_comments(_r, _n):
+        return []
+
+    async def _list_pr_reviews(_r, _n):
+        return []
+
+    github = SimpleNamespace(
+        get_repo=_get_repo,
+        get_issue=_get_issue,
+        list_comments=_list_comments,
+        list_review_comments=list_review_comments,
+        list_pr_reviews=_list_pr_reviews,
+    )
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kwargs: SimpleNamespace(branch="farm/abc/5", session_dir=str(tmp_path / "sess")),
+    )
+
+    # Capture what handle_review hands to run_task, then render the real prompt
+    # through worker._build_prompt so the assertion is on the actual prompt text.
+    captured: dict[str, object] = {}
+    prompts: list[str] = []
+
+    async def _capturing_run_task(**kwargs):
+        captured.update(kwargs)
+        render_kwargs = {k: v for k, v in kwargs.items() if k not in ("inputs", "task_kind")}
+        prompts.append(worker._build_prompt("handle_review", kwargs["inputs"], comment=None, **render_kwargs))
+
+    monkeypatch.setattr(tasks, "run_task", _capturing_run_task)
+    return github, sandbox, captured, prompts
+
+
+async def test_handle_review_surfaces_coalesced_sibling_on_hydration_failure(db, settings, monkeypatch, tmp_path):
+    """With a hydration failure the coalesced sibling's stored payload MUST appear
+    in the rendered prompt: its live-thread message was dropped by the failed
+    sub-fetch, and the skipped sibling's row is the only remaining copy."""
+    # Survivor + coalesced sibling, as the dispatcher's claim path leaves them.
+    db.record_event(
+        delivery_id="sibling-1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "comment": {
+                "user": {"login": "coderabbit"},
+                "body": "sibling finding: null deref",
+                "path": "src/bar.py",
+                "line": 7,
+            },
+        },
+    )
+    await asyncio.sleep(0.01)
+    db.record_event(
+        delivery_id="survivor-1",
+        event_type="pull_request_review_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "pull_request": {"number": 7},
+            "comment": {"user": {"login": "coderabbit"}, "body": "leak at 42", "path": "src/foo.py", "line": 42},
+        },
+    )
+    db.mark_event("sibling-1", "skipped", error=coalesced_error_for("survivor-1"))
+    db.mark_event("survivor-1", "running")
+
+    async def _failing_list_review_comments(_r, _n):
+        raise GitHubError(500, "review-comments endpoint exploded")
+
+    github, sandbox, captured, prompts = _coalesced_review_env(
+        db, settings, tmp_path, monkeypatch, list_review_comments=_failing_list_review_comments
+    )
+    payload = {
+        "pull_request": {"number": 7},
+        "repository": {"full_name": "octo/widget"},
+        "comment": {
+            "user": {"login": "coderabbit"},
+            "body": "leak at 42",
+            "path": "src/foo.py",
+            "line": 42,
+        },
+    }
+
+    await tasks.handle_review(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=payload,
+        delivery_id="survivor-1",
+    )
+
+    # The hydration failure really dropped the sibling from the live thread.
+    thread = captured.get("thread")
+    assert isinstance(thread, tuple) and not any(
+        getattr(m, "body", "") == "sibling finding: null deref" for m in thread
+    ), "test precondition: the failed sub-fetch must drop the sibling's live message"
+    # The survivor's own comment stays the primary finding.
+    assert captured.get("review_payload", {}).get("body") == "leak at 42"
+    prompt = prompts[0]
+    assert "sibling finding: null deref" in prompt, "coalesced sibling's stored body must be in the prompt"
+    assert "Also coalesced into this run" in prompt
+    assert "@coderabbit — review comment on `src/bar.py`:L7" in prompt
+
+
+async def test_handle_review_dedupes_hydrated_coalesced_sibling(db, settings, monkeypatch, tmp_path):
+    sibling_body = "sibling finding: null deref"
+    db.record_event(
+        delivery_id="sibling-live-1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "comment": {
+                "user": {"login": "coderabbit"},
+                "body": sibling_body,
+                "path": "src/bar.py",
+                "line": 7,
+            },
+        },
+    )
+    await asyncio.sleep(0.01)
+    db.record_event(
+        delivery_id="survivor-live-1",
+        event_type="pull_request_review_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "pull_request": {"number": 7},
+            "comment": {"user": {"login": "coderabbit"}, "body": "leak at 42", "path": "src/foo.py", "line": 42},
+        },
+    )
+    db.mark_event("sibling-live-1", "skipped", error=coalesced_error_for("survivor-live-1"))
+    db.mark_event("survivor-live-1", "running")
+
+    async def _list_review_comments(_r, _n):
+        return [
+            SimpleNamespace(
+                author="coderabbit",
+                body=sibling_body,
+                created_at="2026-05-02T10:00:00Z",
+                path="src/bar.py",
+                line=7,
+            )
+        ]
+
+    github, sandbox, captured, prompts = _coalesced_review_env(
+        db, settings, tmp_path, monkeypatch, list_review_comments=_list_review_comments
+    )
+    payload = {
+        "pull_request": {"number": 7},
+        "repository": {"full_name": "octo/widget"},
+        "comment": {
+            "user": {"login": "coderabbit"},
+            "body": "leak at 42",
+            "path": "src/foo.py",
+            "line": 42,
+        },
+    }
+
+    await tasks.handle_review(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=payload,
+        delivery_id="survivor-live-1",
+    )
+
+    thread = captured.get("thread")
+    assert any(getattr(m, "body", "") == sibling_body for m in thread)
+    prompt = prompts[0]
+    assert prompt.count(sibling_body) == 1
+    assert "Also coalesced into this run" not in prompt
+
+
+async def test_handle_review_prompt_unchanged_without_coalesced_sibling(db, settings, monkeypatch, tmp_path):
+    """With no coalesced sibling the rendered prompt carries no coalesced section."""
+    db.record_event(
+        delivery_id="unrelated-1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={"action": "created", "comment": {"body": "a skipped row with a DIFFERENT marker"}},
+    )
+    db.mark_event("unrelated-1", "skipped", error="something else")
+    await asyncio.sleep(0.01)
+    db.record_event(
+        delivery_id="survivor-2",
+        event_type="pull_request_review_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "pull_request": {"number": 7},
+            "comment": {"user": {"login": "coderabbit"}, "body": "leak at 42", "path": "src/foo.py", "line": 42},
+        },
+    )
+    db.mark_event("survivor-2", "running")
+
+    async def _no_review_comments(_r, _n):
+        return []
+
+    github, sandbox, captured, prompts = _coalesced_review_env(
+        db, settings, tmp_path, monkeypatch, list_review_comments=_no_review_comments
+    )
+    payload = {
+        "pull_request": {"number": 7},
+        "repository": {"full_name": "octo/widget"},
+        "comment": {
+            "user": {"login": "coderabbit"},
+            "body": "leak at 42",
+            "path": "src/foo.py",
+            "line": 42,
+        },
+    }
+
+    await tasks.handle_review(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=payload,
+        delivery_id="survivor-2",
+    )
+
+    assert captured.get("coalesced", ()) == (), "no sibling carries the coalesced marker"
+    prompt = prompts[0]
+
+    # Contract: the feature only INSERTED a coalesced placeholder into the
+    # template, which renders empty here. A full byte-for-byte snapshot is
+    # brittle and would fail on the one cosmetic artifact of that empty
+    # placeholder (extra blank lines), so the no-sibling contract is
+    # semantic: (a) every pre-existing content block renders verbatim,
+    # (b) the section document order is unchanged, (c) no new or
+    # unrendered placeholder leaks into the prompt, (d) no coalesced
+    # content at all.
+    # (a) Pre-existing blocks, verbatim: title, hydrated thread entry,
+    # and the primary finding comment.
+    assert "# PR review: octo/widget#7" in prompt
+    assert "### @alice — PR body\n\nb" in prompt
+    assert "## @coderabbit — `src/foo.py`:L42\n\nleak at 42" in prompt
+    assert "MUST read diff context around cited line range before acting." in prompt
+    # (b) Pre-feature document order is preserved.
+    assert (
+        prompt.index("## Prior conversation") < prompt.index("## @coderabbit — `src/foo.py`:L42") < prompt.index("---")
+    )
+    # (c) No unrendered/unknown placeholder reached the consumer.
+    assert "{{" not in prompt
+    # (d) No coalesced section, marker, or skip marker leaked in.
+    assert "Also coalesced into this run" not in prompt
+    assert "a skipped row with a DIFFERENT marker" not in prompt
+    assert COALESCED_ERROR not in prompt
+
+
+async def test_handle_pr_conversation_surfaces_coalesced_sibling_on_hydration_failure(
+    db, settings, monkeypatch, tmp_path
+):
+    """A superseded reviewer-bot issue_comment on a PR conversation MUST have its
+    stored finding rendered into the survivor's prompt even when live-thread
+    hydration does not expose it: `handle_pr_conversation` feeds `handle_comment`,
+    whose prompt (previously) never loaded coalesced payloads, so a hydration
+    failure silently dropped the skipped sibling's finding."""
+    sibling_body = "sibling finding: null deref"
+    db.upsert_issue(
+        key="octo/widget#5",
+        repo="octo/widget",
+        number=5,
+        state="open",
+        branch="farm/abc/5",
+        pr_number=7,
+    )
+    # Survivor + coalesced sibling, both reviewer-bot PR-conversation issue_comments
+    # (the coalesce-able review events for the `handle_pr_conversation` route).
+    db.record_event(
+        delivery_id="sibling-1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "issue": {"number": 7, "pull_request": {"url": "https://x/octo/widget/pulls/7"}},
+            "comment": {"user": {"login": "coderabbit"}, "body": sibling_body},
+            "_robomp_directive": {"author": "coderabbit", "body": "address this"},
+        },
+    )
+    await asyncio.sleep(0.01)
+    db.record_event(
+        delivery_id="survivor-1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "issue": {"number": 7, "pull_request": {"url": "https://x/octo/widget/pulls/7"}},
+            "comment": {"user": {"login": "coderabbit"}, "body": "leak at 42"},
+            "_robomp_directive": {"author": "coderabbit", "body": "address this"},
+        },
+    )
+    db.mark_event("sibling-1", "skipped", error=coalesced_error_for("survivor-1"))
+    db.mark_event("survivor-1", "running")
+
+    repo = RepoInfo(
+        full_name="octo/widget",
+        default_branch="main",
+        clone_url="https://x/octo/widget.git",
+        private=False,
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=5,
+        title="bug",
+        body="b",
+        state="open",
+        author="alice",
+        labels=(),
+        is_pull_request=False,
+    )
+
+    async def _get_repo(_r):
+        return repo
+
+    async def _get_issue(_r, _n):
+        return issue
+
+    # Hydration exposes ONLY the PR body — the sibling's live comment is dropped,
+    # so the coalesced stored payload is the only remaining copy of its finding.
+    async def _no_comments(_r, _n):
+        return []
+
+    github = SimpleNamespace(
+        get_repo=_get_repo,
+        get_issue=_get_issue,
+        list_comments=_no_comments,
+        list_review_comments=_no_comments,
+        list_pr_reviews=_no_comments,
+    )
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kwargs: SimpleNamespace(branch="farm/abc/5", session_dir=str(tmp_path / "sess")),
+    )
+
+    captured: dict[str, object] = {}
+    prompts: list[str] = []
+
+    async def _capturing_run_task(**kwargs):
+        captured.update(kwargs)
+        render_kwargs = {k: v for k, v in kwargs.items() if k not in ("inputs", "task_kind")}
+        # `handle_comment` does not pass `review_payload`; `_build_prompt` still
+        # requires the kwarg (unused for this task kind), so supply a default.
+        render_kwargs.setdefault("review_payload", None)
+        prompts.append(worker._build_prompt("handle_comment", kwargs["inputs"], **render_kwargs))
+
+    monkeypatch.setattr(tasks, "run_task", _capturing_run_task)
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload={
+            "action": "created",
+            "repository": {"full_name": "octo/widget"},
+            "issue": {"number": 7, "pull_request": {"url": "https://x/octo/widget/pulls/7"}},
+            "comment": {"user": {"login": "coderabbit"}, "body": "leak at 42"},
+            "_robomp_directive": {"author": "coderabbit", "body": "address this"},
+        },
+        delivery_id="survivor-1",
+    )
+
+    # The hydration failure really dropped the sibling from the live thread.
+    thread = captured.get("thread")
+    assert isinstance(thread, tuple) and not any(getattr(m, "body", "") == sibling_body for m in thread), (
+        "test precondition: the failed sub-fetch must drop the sibling's live message"
+    )
+    assert captured.get("coalesced", ()), "handle_pr_conversation must load coalesced payloads"
+
+    prompt = prompts[0]
+    assert sibling_body in prompt, "coalesced sibling's stored body must be in the prompt"
+    assert "Also coalesced into this run" in prompt
+    # Sanity: the survivor's own directive (the primary finding) is still rendered.
+    assert "address this" in prompt
+
+
+async def test_handle_pr_conversation_dedupes_hydrated_sibling_via_body_when_author_differs(
+    db, settings, monkeypatch, tmp_path
+):
+    """When the hydrated live thread already carries the sibling's body, the
+    coalesced section MUST NOT render a second copy even though the (author,
+    body) identity pair differs — the dedup key must fall back to the bare
+    body. The stored sibling payload has no `user.login` (a real GitHub
+    payload gap) while the live thread message is attributed to "coderabbit",
+    so the only working identity here is the body itself."""
+    sibling_body = "sibling finding: null deref"
+    db.upsert_issue(
+        key="octo/widget#5",
+        repo="octo/widget",
+        number=5,
+        state="open",
+        branch="farm/abc/5",
+        pr_number=7,
+    )
+    # Sibling stored WITHOUT a login: `_coalesced_payloads` yields author "".
+    db.record_event(
+        delivery_id="sibling-1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "issue": {"number": 7, "pull_request": {"url": "https://x/octo/widget/pulls/7"}},
+            "comment": {"body": sibling_body},
+            "_robomp_directive": {"author": "coderabbit", "body": "address this"},
+        },
+    )
+    await asyncio.sleep(0.01)
+    db.record_event(
+        delivery_id="survivor-1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#5",
+        payload={
+            "action": "created",
+            "issue": {"number": 7, "pull_request": {"url": "https://x/octo/widget/pulls/7"}},
+            "comment": {"user": {"login": "coderabbit"}, "body": "leak at 42"},
+            "_robomp_directive": {"author": "can1357", "body": "address this"},
+        },
+    )
+    db.mark_event("sibling-1", "skipped", error=coalesced_error_for("survivor-1"))
+    db.mark_event("survivor-1", "running")
+
+    repo = RepoInfo(
+        full_name="octo/widget",
+        default_branch="main",
+        clone_url="https://x/octo/widget.git",
+        private=False,
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=5,
+        title="bug",
+        body="b",
+        state="open",
+        author="alice",
+        labels=(),
+        is_pull_request=False,
+    )
+
+    async def _get_repo(_r):
+        return repo
+
+    async def _get_issue(_r, _n):
+        return issue
+
+    # Hydration SUCCEEDS and returns the sibling's live comment — the same
+    # body as the stored payload, attributed to a login the stored payload lacks.
+    async def _comments(_r, _n):
+        return [SimpleNamespace(author="coderabbit", body=sibling_body, created_at="2026-05-02T10:00:00Z")]
+
+    async def _none(_r, _n):
+        return []
+
+    github = SimpleNamespace(
+        get_repo=_get_repo,
+        get_issue=_get_issue,
+        list_comments=_comments,
+        list_review_comments=_none,
+        list_pr_reviews=_none,
+    )
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kwargs: SimpleNamespace(branch="farm/abc/5", session_dir=str(tmp_path / "sess")),
+    )
+
+    captured: dict[str, object] = {}
+    prompts: list[str] = []
+
+    async def _capturing_run_task(**kwargs):
+        captured.update(kwargs)
+        render_kwargs = {k: v for k, v in kwargs.items() if k not in ("inputs", "task_kind")}
+        render_kwargs.setdefault("review_payload", None)
+        prompts.append(worker._build_prompt("handle_comment", kwargs["inputs"], **render_kwargs))
+
+    monkeypatch.setattr(tasks, "run_task", _capturing_run_task)
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload={
+            "action": "created",
+            "repository": {"full_name": "octo/widget"},
+            "issue": {"number": 7, "pull_request": {"url": "https://x/octo/widget/pulls/7"}},
+            "comment": {"user": {"login": "coderabbit"}, "body": "leak at 42"},
+            "_robomp_directive": {"author": "can1357", "body": "address this"},
+        },
+        delivery_id="survivor-1",
+    )
+
+    # Preconditions: the body IS in the hydrated live thread (so the coalesced
+    # section is redundant) and the loaded coalesced payload has no author.
+    # On the directive route the hydrated thread rides on the DirectiveInfo.
+    directive = captured.get("directive")
+    d_thread = getattr(directive, "thread", ()) if directive is not None else ()
+    assert any(getattr(m, "body", "") == sibling_body and getattr(m, "author", "") == "coderabbit" for m in d_thread), (
+        "test precondition: live thread carries the sibling body attributed to coderabbit"
+    )
+    coalesced = captured.get("coalesced", ())
+    assert coalesced, "handle_pr_conversation must load the coalesced sibling payload"
+    assert all(not p.get("author") for p in coalesced), "test precondition: stored sibling payload carries no author"
+
+    prompt = prompts[0]
+    assert prompt.count(sibling_body) == 1, (
+        "body-only fallback MUST dedup the coalesced section against the hydrated thread"
+    )
+    assert "Also coalesced into this run" not in prompt
+    # Sanity: the survivor's own directive is still rendered.
+    assert "address this" in prompt
+
+
+@pytest.mark.asyncio
+async def test_handle_pr_conversation_refetches_stale_placeholder_body(db, tmp_path, settings, monkeypatch) -> None:
+    """Reviewer bots post a placeholder and edit in the findings seconds later;
+    the webhook snapshot is stale, so the canonical comment text is re-fetched
+    by id and both the comment and the directive handed to run_task carry it."""
+    from robomp.github_client import CommentInfo
+
+    workspace = SimpleNamespace(
+        root=tmp_path,
+        repo_dir=tmp_path,
+        session_dir=tmp_path,
+        branch="robomp/issue-42",
+    )
+    db.upsert_issue(
+        key="octo/widget#42",
+        repo="octo/widget",
+        number=42,
+        state="opened",
+        branch=workspace.branch,
+        session_dir=str(workspace.session_dir),
+        pr_number=7,
+    )
+    placeholder = "Reviewing this PR…"
+    full_body = "Mira walkthrough: the trailing descriptor parse drops the credit."
+    fetched_ids: list[int] = []
+
+    class FakeGitHub:
+        async def get_repo(self, repo: str) -> RepoInfo:
+            return RepoInfo(full_name=repo, default_branch="main", clone_url="https://x/octo/widget.git", private=False)
+
+        async def get_issue(self, repo: str, number: int) -> IssueInfo:
+            return IssueInfo(
+                repo=repo,
+                number=number,
+                title="proposal",
+                body="issue body",
+                state="open",
+                author="alice",
+                labels=("proposal",),
+                is_pull_request=False,
+            )
+
+        async def get_issue_comment(self, repo: str, comment_id: int) -> CommentInfo:
+            fetched_ids.append(comment_id)
+            return CommentInfo(id=comment_id, author="miracodeai-bot", body=full_body, created_at="")
+
+    captured: dict[str, object] = {}
+
+    async def fake_attach_thread(_github, directive, repo, number, *, is_pr):
+        assert repo == "octo/widget"
+        assert number == 7
+        assert is_pr is True
+        captured["attached_body"] = directive.body if directive is not None else None
+        return directive
+
+    async def fake_run_task(*, task_kind, inputs, comment, pr_number, directive, **_kwargs):
+        del inputs, pr_number
+        captured["task_kind"] = task_kind
+        captured["comment_body"] = comment.body
+        captured["directive_body"] = directive.body if directive is not None else None
+
+    monkeypatch.setattr(tasks, "_attach_thread", fake_attach_thread)
+    monkeypatch.setattr(tasks, "run_task", fake_run_task)
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=FakeGitHub(),
+        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **_kwargs: workspace),
+        git_transport=SimpleNamespace(),
+        payload={
+            "repository": {"full_name": "octo/widget"},
+            "issue": {"number": 7, "pull_request": {"url": "https://api.github.com/repos/octo/widget/pulls/7"}},
+            "comment": {
+                "id": 14253,
+                "body": placeholder,
+                "created_at": "2026-01-01T00:00:00Z",
+                "user": {"login": "miracodeai-bot"},
+            },
+            "_robomp_directive": {"body": placeholder, "author": "miracodeai-bot"},
+        },
+        delivery_id="d-pr-comment",
+    )
+
+    assert fetched_ids == [14253]
+    assert captured["task_kind"] == "handle_comment"
+    assert captured["comment_body"] == full_body
+    assert captured["directive_body"] == full_body
+    assert captured["attached_body"] == full_body
 
 
 @pytest.mark.asyncio
@@ -450,9 +1108,9 @@ async def test_handle_review_attaches_conversation_thread(db, settings, monkeypa
     assert "prior request" in bodies
 
 
-@pytest.mark.asyncio
-async def test_handle_review_refetch_failure_falls_back_to_webhook_body(db, settings, monkeypatch) -> None:
-    """When get_review_comment raises, the webhook body + path/line are preserved."""
+async def test_handle_review_forgejo_empty_body_fetches_comment_text_by_id(db, settings, monkeypatch) -> None:
+    """Forgejo #7935: a `pull_request_review_comment` payload with empty `body`
+    must pull the real text via `get_review_comment(id)` before handing off."""
     key = tasks.issue_key("octo/widget", 9)
     db.upsert_issue(
         key=key,
@@ -465,6 +1123,108 @@ async def test_handle_review_refetch_failure_falls_back_to_webhook_body(db, sett
     )
     row = db.get_issue(key)
     assert row is not None
+
+    fetched_calls: list[tuple[str, int]] = []
+
+    class _FakeGH:
+        async def get_repo(self, repo):
+            return RepoInfo(
+                full_name=repo,
+                default_branch="main",
+                clone_url="https://x/octo/widget.git",
+                private=False,
+            )
+
+        async def get_issue(self, repo, number):
+            return IssueInfo(
+                repo=repo,
+                number=number,
+                title="t",
+                body="b",
+                state="open",
+                author="a",
+                labels=(),
+                is_pull_request=False,
+            )
+
+        async def get_issue_comment(self, repo, comment_id):
+            # A review id is not an issue comment on this path: 404 -> fall back
+            # to the review walk below.
+            raise GitHubError(404, "not an issue comment")
+
+        async def get_review_comment(self, repo, comment_id, pr_number=None):
+            fetched_calls.append((repo, int(comment_id)))
+            return ReviewCommentInfo(
+                id=int(comment_id),
+                author="alice",
+                body="the real comment text",
+                path="src/app.py",
+                line=5,
+                created_at="2026-01-01T00:00:00Z",
+            )
+
+        async def get_pr_review(self, repo, review_id, *, pr_number=None):
+            raise AssertionError("review summary must not be fetched once the walk resolves")
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_task(*, task_kind, inputs, pr_number, review_payload, **_kwargs):
+        del inputs, pr_number
+        captured["kind"] = task_kind
+        captured["review_payload"] = review_payload
+
+    async def fake_resolve(**_kwargs):
+        return (row, None)
+
+    async def fake_workspace_op(func, **_kwargs):
+        del func
+        return SimpleNamespace(branch="farm/abc/review", session_dir="/tmp/sess")
+
+    monkeypatch.setattr(tasks, "run_task", fake_run_task)
+    monkeypatch.setattr(tasks, "_resolve_issue_row_for_pr", fake_resolve)
+    monkeypatch.setattr(tasks, "_run_workspace_op", fake_workspace_op)
+
+    await tasks.handle_review(
+        settings=settings,
+        db=db,
+        github=_FakeGH(),
+        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **k: None),
+        git_transport=None,
+        payload={
+            "pull_request": {"number": 99},
+            "repository": {"full_name": "octo/widget"},
+            "review": {"content": "", "id": 42},  # forgejo empty-body review
+            "sender": {"login": "alice"},
+        },
+        delivery_id="d1",
+    )
+
+    assert fetched_calls == [("octo/widget", 42)]
+    assert captured["kind"] == "handle_review"
+    payload = captured["review_payload"]  # type: ignore[index]
+    assert payload["body"] == "the real comment text"
+    assert payload["path"] == "src/app.py"
+    assert payload["line"] == 5
+
+
+@pytest.mark.asyncio
+async def test_handle_review_inline_comment_falls_back_to_review_walk(db, settings, monkeypatch) -> None:
+    """An inline review comment 404s on the issue-comment endpoint; the review
+    walk then supplies the body and enriches path/line."""
+    key = tasks.issue_key("octo/widget", 9)
+    db.upsert_issue(
+        key=key,
+        repo="octo/widget",
+        number=9,
+        state="opened",
+        branch="farm/abc/review",
+        session_dir="/tmp/sess",
+        pr_number=99,
+    )
+    row = db.get_issue(key)
+    assert row is not None
+
+    review_walk_calls: list[tuple[str, int]] = []
 
     class _FakeGH:
         async def get_repo(self, repo):
@@ -491,10 +1251,15 @@ async def test_handle_review_refetch_failure_falls_back_to_webhook_body(db, sett
             raise GitHubError(404, "not an issue comment")
 
         async def get_review_comment(self, repo, comment_id, pr_number=None):
-            raise GitHubError(500, "internal error")
-
-        async def get_pr_review(self, repo, review_id, *, pr_number=None):
-            raise GitHubError(404, "not a review either")
+            review_walk_calls.append((repo, int(comment_id)))
+            return ReviewCommentInfo(
+                id=int(comment_id),
+                author="mira",
+                body="inline finding",
+                path="src/app.py",
+                line=145,
+                created_at="2026-08-07T21:48:00Z",
+            )
 
     captured: dict[str, object] = {}
 
@@ -525,21 +1290,23 @@ async def test_handle_review_refetch_failure_falls_back_to_webhook_body(db, sett
             "repository": {"full_name": "octo/widget"},
             "comment": {
                 "id": 42,
-                "body": "webhook body",
-                "path": "src/webhook.py",
-                "line": 10,
-                "user": {"login": "alice"},
+                "body": "Reviewing this PR…",
+                "path": "legacy/path.go",
+                "line": 100,
+                "user": {"login": "stale-bot"},
             },
-            "sender": {"login": "alice"},
+            "sender": {"login": "stale-bot"},
         },
         delivery_id="d1",
     )
 
+    assert review_walk_calls == [("octo/widget", 42)]
     assert captured["kind"] == "handle_review"
     payload = captured["review_payload"]  # type: ignore[index]
-    assert payload["body"] == "webhook body"
-    assert payload["path"] == "src/webhook.py"
-    assert payload["line"] == 10
+    assert payload["body"] == "inline finding"
+    assert payload["author"] == "mira"
+    assert payload["path"] == "src/app.py"
+    assert payload["line"] == 145
 
 
 @pytest.mark.asyncio
@@ -649,6 +1416,192 @@ async def test_handle_review_placeholder_body_is_replaced_by_authoritative_refet
 
 
 @pytest.mark.asyncio
+async def test_handle_review_refetch_failure_falls_back_to_webhook_body(db, settings, monkeypatch) -> None:
+    """When get_review_comment raises, the webhook body + path/line are preserved."""
+    key = tasks.issue_key("octo/widget", 9)
+    db.upsert_issue(
+        key=key,
+        repo="octo/widget",
+        number=9,
+        state="opened",
+        branch="farm/abc/review",
+        session_dir="/tmp/sess",
+        pr_number=99,
+    )
+    row = db.get_issue(key)
+    assert row is not None
+
+    class _FakeGH:
+        async def get_repo(self, repo):
+            return RepoInfo(
+                full_name=repo,
+                default_branch="main",
+                clone_url="https://x/octo/widget.git",
+                private=False,
+            )
+
+        async def get_issue(self, repo, number):
+            return IssueInfo(
+                repo=repo,
+                number=number,
+                title="t",
+                body="b",
+                state="open",
+                author="a",
+                labels=(),
+                is_pull_request=False,
+            )
+
+        async def get_issue_comment(self, repo, comment_id):
+            raise GitHubError(404, "not an issue comment")
+
+        async def get_review_comment(self, repo, comment_id, pr_number=None):
+            raise GitHubError(500, "internal error")
+
+        async def get_pr_review(self, repo, review_id, *, pr_number=None):
+            raise GitHubError(404, "not a review either")
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_task(*, task_kind, inputs, pr_number, review_payload, **_kwargs):
+        del inputs, pr_number
+        captured["kind"] = task_kind
+        captured["review_payload"] = review_payload
+
+    async def fake_resolve(**_kwargs):
+        return (row, None)
+
+    async def fake_workspace_op(func, **_kwargs):
+        del func
+        return SimpleNamespace(branch="farm/abc/review", session_dir="/tmp/sess")
+
+    monkeypatch.setattr(tasks, "run_task", fake_run_task)
+    monkeypatch.setattr(tasks, "_resolve_issue_row_for_pr", fake_resolve)
+    monkeypatch.setattr(tasks, "_run_workspace_op", fake_workspace_op)
+
+    await tasks.handle_review(
+        settings=settings,
+        db=db,
+        github=_FakeGH(),
+        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **k: None),
+        git_transport=None,
+        payload={
+            "pull_request": {"number": 99},
+            "repository": {"full_name": "octo/widget"},
+            "comment": {
+                "id": 42,
+                "body": "webhook body",
+                "path": "src/webhook.py",
+                "line": 10,
+                "user": {"login": "alice"},
+            },
+            "sender": {"login": "alice"},
+        },
+        delivery_id="d1",
+    )
+
+    assert captured["kind"] == "handle_review"
+    payload = captured["review_payload"]  # type: ignore[index]
+    assert payload["body"] == "webhook body"
+    assert payload["path"] == "src/webhook.py"
+    assert payload["line"] == 10
+
+
+@pytest.mark.asyncio
+async def test_handle_review_summary_resolves_via_issue_comment(db, settings, monkeypatch) -> None:
+    """A review *summary* (no inline comment) resolves on the issue-comment
+    endpoint: the body/author come from there and no path is implied."""
+    from robomp.github_client import CommentInfo
+
+    key = tasks.issue_key("octo/widget", 9)
+    db.upsert_issue(
+        key=key,
+        repo="octo/widget",
+        number=9,
+        state="opened",
+        branch="farm/abc/review",
+        session_dir="/tmp/sess",
+        pr_number=99,
+    )
+    row = db.get_issue(key)
+    assert row is not None
+
+    fetched_issue: list[tuple[str, int]] = []
+    review_walk_calls: list[int] = []
+    full_body = "Mira walkthrough: the trailing descriptor parse drops the credit."
+
+    class _FakeGH:
+        async def get_repo(self, repo):
+            return RepoInfo(
+                full_name=repo,
+                default_branch="main",
+                clone_url="https://x/octo/widget.git",
+                private=False,
+            )
+
+        async def get_issue(self, repo, number):
+            return IssueInfo(
+                repo=repo,
+                number=number,
+                title="t",
+                body="b",
+                state="open",
+                author="a",
+                labels=(),
+                is_pull_request=False,
+            )
+
+        async def get_issue_comment(self, repo, comment_id):
+            fetched_issue.append((repo, int(comment_id)))
+            return CommentInfo(id=int(comment_id), author="mira", body=full_body, created_at="2026-08-07T21:48:00Z")
+
+        async def get_review_comment(self, repo, comment_id, pr_number=None):
+            review_walk_calls.append(int(comment_id))
+            raise AssertionError("review walk must not run when the summary resolves")
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_task(*, task_kind, inputs, pr_number, review_payload, **_kwargs):
+        del inputs, pr_number
+        captured["kind"] = task_kind
+        captured["review_payload"] = review_payload
+
+    async def fake_resolve(**_kwargs):
+        return (row, None)
+
+    async def fake_workspace_op(func, **_kwargs):
+        del func
+        return SimpleNamespace(branch="farm/abc/review", session_dir="/tmp/sess")
+
+    monkeypatch.setattr(tasks, "run_task", fake_run_task)
+    monkeypatch.setattr(tasks, "_resolve_issue_row_for_pr", fake_resolve)
+    monkeypatch.setattr(tasks, "_run_workspace_op", fake_workspace_op)
+
+    await tasks.handle_review(
+        settings=settings,
+        db=db,
+        github=_FakeGH(),
+        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **k: None),
+        git_transport=None,
+        payload={
+            "pull_request": {"number": 99},
+            "repository": {"full_name": "octo/widget"},
+            "review": {"content": "Reviewing this PR…", "id": 42},
+            "sender": {"login": "stale-bot"},
+        },
+        delivery_id="d1",
+    )
+
+    assert fetched_issue == [("octo/widget", 42)]
+    assert review_walk_calls == []
+    assert captured["kind"] == "handle_review"
+    payload = captured["review_payload"]  # type: ignore[index]
+    assert payload["body"] == full_body
+    assert payload["author"] == "mira"
+    assert payload["path"] == ""
+
+
+@pytest.mark.asyncio
 async def test_handle_review_verdict_resolves_via_review_summary(db, settings, monkeypatch) -> None:
     """An approve/request-changes verdict carries the body on the review *summary*:
     the id 404s on the issue-comment endpoint AND in the review walk (no inline
@@ -750,288 +1703,605 @@ async def test_handle_review_verdict_resolves_via_review_summary(db, settings, m
     assert payload["line"] is None
 
 
-@pytest.mark.asyncio
-async def test_handle_pr_conversation_refetches_stale_placeholder_body(db, tmp_path, settings, monkeypatch) -> None:
-    """Reviewer bots post a placeholder and edit in the findings seconds later;
-    the webhook snapshot is stale, so the canonical comment text is re-fetched
-    by id and both the comment and the directive handed to run_task carry it."""
-    from robomp.github_client import CommentInfo
+@pytest.fixture
+def tracker() -> pr_status.StatusTracker:
+    # Fresh per-app tracker per test: the review_pr calls below pass it
+    # explicitly, so no module-level state is mutated.
+    return pr_status.StatusTracker()
 
-    workspace = SimpleNamespace(
-        root=tmp_path,
-        repo_dir=tmp_path,
-        session_dir=tmp_path,
-        branch="robomp/issue-42",
-    )
-    db.upsert_issue(
-        key="octo/widget#42",
+
+def _phase_of(description: str) -> str:
+    """Recover the phase a recorded status description came from.
+
+    A detail suffix, when present, is appended as `base — detail`, so each
+    base is a distinct prefix and `startswith` alone disambiguates.
+    """
+    for phase, (_state, base) in pr_status.PHASE_STATUS.items():
+        if description.startswith(base):
+            return phase
+    raise AssertionError(f"no phase matches description: {description!r}")
+
+
+def _noop_run_task(**_kw):
+    async def _c():
+        return None
+
+    return _c()
+
+
+def _never_run_task(**_kw):
+    async def _c():
+        raise AssertionError("run_task must not be reached")
+
+    return _c()
+
+
+def _pr_payload(pr_number: int = 7, sha: str = "deadbeef") -> dict:
+    return {
+        "pull_request": {"number": pr_number, "head": {"sha": sha}},
+        "repository": {"full_name": "octo/widget"},
+    }
+
+
+def _claim_event(db: Database, delivery_id: str = "d1") -> None:
+    """Seed + claim the delivery so `started_at` exists: the success decision
+    is scoped to the run window (audit rows at/after `started_at`), so the
+    tests must behave like the dispatcher and claim the row first."""
+    db.record_event(
+        delivery_id=delivery_id,
+        event_type="pull_request",
         repo="octo/widget",
-        number=42,
-        state="opened",
-        branch=workspace.branch,
-        session_dir=str(workspace.session_dir),
-        pr_number=7,
+        issue_key="octo/widget#7",
+        payload=_pr_payload(),
     )
-    placeholder = "Reviewing this PR…"
-    full_body = "Mira walkthrough: the trailing descriptor parse drops the credit."
-    fetched_ids: list[int] = []
+    claimed = db.claim_next_event()
+    assert claimed is not None and claimed.delivery_id == delivery_id
 
-    class FakeGitHub:
-        async def get_repo(self, repo: str) -> RepoInfo:
-            return RepoInfo(full_name=repo, default_branch="main", clone_url="https://x/octo/widget.git", private=False)
 
-        async def get_issue(self, repo: str, number: int) -> IssueInfo:
-            return IssueInfo(
-                repo=repo,
-                number=number,
-                title="proposal",
-                body="issue body",
-                state="open",
-                author="alice",
-                labels=("proposal",),
-                is_pull_request=False,
-            )
+def _pr_github(record: list, *, fail_fetch: bool = False, fail_exc: Exception | None = None) -> SimpleNamespace:
+    repo = RepoInfo(
+        full_name="octo/widget",
+        default_branch="main",
+        clone_url="https://x/octo/widget.git",
+        private=False,
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=7,
+        title="pr",
+        body="b",
+        state="open",
+        author="alice",
+        labels=(),
+        is_pull_request=True,
+    )
+    pr = PullRequestInfo(
+        repo="octo/widget",
+        number=7,
+        html_url="https://example/7",
+        head_ref="feat",
+        base_ref="main",
+        state="open",
+        head_sha="deadbeef",
+    )
 
-        async def get_issue_comment(self, repo: str, comment_id: int) -> CommentInfo:
-            fetched_ids.append(comment_id)
-            return CommentInfo(id=comment_id, author="miracodeai-bot", body=full_body, created_at="")
+    async def _get_repo(_full):
+        return repo
 
-    captured: dict[str, object] = {}
+    async def _get_issue(_full, _n):
+        return issue
 
-    async def fake_attach_thread(_github, directive, repo, number, *, is_pr):
-        assert repo == "octo/widget"
-        assert number == 7
-        assert is_pr is True
-        captured["attached_body"] = directive.body if directive is not None else None
-        return directive
+    async def _get_pr(_full, _n):
+        if fail_exc is not None:
+            raise fail_exc
+        if fail_fetch:
+            raise GitHubError(500, "upstream 500")
+        return pr
 
-    async def fake_run_task(*, task_kind, inputs, comment, pr_number, directive, **_kwargs):
-        del inputs, pr_number
-        captured["task_kind"] = task_kind
-        captured["comment_body"] = comment.body
-        captured["directive_body"] = directive.body if directive is not None else None
+    async def _create_commit_status(_repo, sha, *, state, context, description="", target_url=None):
+        record.append((sha, state, context, description))
 
-    monkeypatch.setattr(tasks, "_attach_thread", fake_attach_thread)
-    monkeypatch.setattr(tasks, "run_task", fake_run_task)
+    return SimpleNamespace(
+        get_repo=_get_repo,
+        get_issue=_get_issue,
+        get_pull_request=_get_pr,
+        create_commit_status=_create_commit_status,
+    )
 
-    await tasks.handle_pr_conversation(
+
+async def test_review_pr_publishes_preparing_then_terminal_status(db, settings, monkeypatch, tmp_path, tracker):
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    record: list[tuple] = []
+    monkeypatch.setattr(tasks, "run_task", _noop_run_task)
+    _claim_event(db)
+
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="farm/x/y", session_dir=str(tmp_path / "s")),
+    )
+    await tasks.review_pr(
         settings=settings,
         db=db,
-        github=FakeGitHub(),
-        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **_kwargs: workspace),
+        github=_pr_github(record),
+        sandbox=sandbox,
         git_transport=SimpleNamespace(),
-        payload={
-            "repository": {"full_name": "octo/widget"},
-            "issue": {"number": 7, "pull_request": {"url": "https://api.github.com/repos/octo/widget/pulls/7"}},
-            "comment": {
-                "id": 14253,
-                "body": placeholder,
-                "created_at": "2026-01-01T00:00:00Z",
-                "user": {"login": "miracodeai-bot"},
-            },
-            "_robomp_directive": {"body": placeholder, "author": "miracodeai-bot"},
-        },
-        delivery_id="d-pr-comment",
+        payload=_pr_payload(),
+        delivery_id="d1",
+        attempts=1,
+        status_tracker=tracker,
     )
-
-    assert fetched_ids == [14253]
-    assert captured["task_kind"] == "handle_comment"
-    assert captured["comment_body"] == full_body
-    assert captured["directive_body"] == full_body
-    assert captured["attached_body"] == full_body
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["preparing", "failure"]
+    # A failed run must NOT record the head as reviewed.
+    assert db.get_issue("octo/widget#7").last_reviewed_sha is None
 
 
-@pytest.mark.asyncio
-async def test_handle_review_summary_resolves_via_issue_comment(db, settings, monkeypatch) -> None:
-    """A review *summary* (no inline comment) resolves on the issue-comment
-    endpoint: the body/author come from there and no path is implied."""
-    from robomp.github_client import CommentInfo
+async def test_review_pr_success_variants(db, settings, monkeypatch, tmp_path, tracker):
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    record: list[tuple] = []
+    _claim_event(db)
 
-    key = tasks.issue_key("octo/widget", 9)
-    db.upsert_issue(
-        key=key,
-        repo="octo/widget",
-        number=9,
-        state="opened",
-        branch="farm/abc/review",
-        session_dir="/tmp/sess",
-        pr_number=99,
+    async def _fake_run_task(**_kw):
+        # The agent posted the review during the turn.
+        db.log_tool_call(issue_key="octo/widget#7", tool="submit_pr_review", args={})
+
+    monkeypatch.setattr(tasks, "run_task", _fake_run_task)
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="farm/x/y", session_dir=str(tmp_path / "s")),
     )
-    row = db.get_issue(key)
-    assert row is not None
-
-    fetched_issue: list[tuple[str, int]] = []
-    review_walk_calls: list[int] = []
-    full_body = "Mira walkthrough: the trailing descriptor parse drops the credit."
-
-    class _FakeGH:
-        async def get_repo(self, repo):
-            return RepoInfo(
-                full_name=repo,
-                default_branch="main",
-                clone_url="https://x/octo/widget.git",
-                private=False,
-            )
-
-        async def get_issue(self, repo, number):
-            return IssueInfo(
-                repo=repo,
-                number=number,
-                title="t",
-                body="b",
-                state="open",
-                author="a",
-                labels=(),
-                is_pull_request=False,
-            )
-
-        async def get_issue_comment(self, repo, comment_id):
-            fetched_issue.append((repo, int(comment_id)))
-            return CommentInfo(id=int(comment_id), author="mira", body=full_body, created_at="2026-08-07T21:48:00Z")
-
-        async def get_review_comment(self, repo, comment_id, pr_number=None):
-            review_walk_calls.append(int(comment_id))
-            raise AssertionError("review walk must not run when the summary resolves")
-
-    captured: dict[str, object] = {}
-
-    async def fake_run_task(*, task_kind, inputs, pr_number, review_payload, **_kwargs):
-        del inputs, pr_number
-        captured["kind"] = task_kind
-        captured["review_payload"] = review_payload
-
-    async def fake_resolve(**_kwargs):
-        return (row, None)
-
-    async def fake_workspace_op(func, **_kwargs):
-        del func
-        return SimpleNamespace(branch="farm/abc/review", session_dir="/tmp/sess")
-
-    monkeypatch.setattr(tasks, "run_task", fake_run_task)
-    monkeypatch.setattr(tasks, "_resolve_issue_row_for_pr", fake_resolve)
-    monkeypatch.setattr(tasks, "_run_workspace_op", fake_workspace_op)
-
-    await tasks.handle_review(
+    await tasks.review_pr(
         settings=settings,
         db=db,
-        github=_FakeGH(),
-        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **k: None),
-        git_transport=None,
-        payload={
-            "pull_request": {"number": 99},
-            "repository": {"full_name": "octo/widget"},
-            "review": {"content": "Reviewing this PR…", "id": 42},
-            "sender": {"login": "stale-bot"},
-        },
+        github=_pr_github(record),
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_payload(),
         delivery_id="d1",
+        attempts=1,
+        status_tracker=tracker,
     )
-
-    assert fetched_issue == [("octo/widget", 42)]
-    assert review_walk_calls == []
-    assert captured["kind"] == "handle_review"
-    payload = captured["review_payload"]  # type: ignore[index]
-    assert payload["body"] == full_body
-    assert payload["author"] == "mira"
-    assert payload["path"] == ""
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["preparing", "success"]
+    # A landed run records the head it reviewed.
+    assert db.get_issue("octo/widget#7").last_reviewed_sha == "deadbeef"
 
 
-@pytest.mark.asyncio
-async def test_handle_review_inline_comment_falls_back_to_review_walk(db, settings, monkeypatch) -> None:
-    """An inline review comment 404s on the issue-comment endpoint; the review
-    walk then supplies the body and enriches path/line."""
-    key = tasks.issue_key("octo/widget", 9)
+async def test_review_pr_workspace_failure_is_retrying_and_propagates(db, settings, monkeypatch, tmp_path, tracker):
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    monkeypatch.setattr(tasks, "run_task", _never_run_task)
+    _claim_event(db)
+
+    def _boom(**_kw):
+        raise OSError("clone failed")
+
+    sandbox = SimpleNamespace(natives_cache=None, ensure_workspace=_boom)
+    with pytest.raises(OSError):
+        await tasks.review_pr(
+            settings=settings,
+            db=db,
+            github=_pr_github(record),
+            sandbox=sandbox,
+            git_transport=SimpleNamespace(),
+            payload=_pr_payload(),
+            delivery_id="d1",
+            attempts=1,
+            status_tracker=tracker,
+        )
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["preparing", "retrying"]
+
+
+async def test_review_pr_exhausted_retries_are_terminal_error(db, settings, monkeypatch, tmp_path, tracker):
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    monkeypatch.setattr(tasks, "run_task", _never_run_task)
+    _claim_event(db)
+
+    def _boom(**_kw):
+        raise OSError("clone failed")
+
+    sandbox = SimpleNamespace(natives_cache=None, ensure_workspace=_boom)
+    with pytest.raises(OSError):
+        await tasks.review_pr(
+            settings=settings,
+            db=db,
+            github=_pr_github(record),
+            sandbox=sandbox,
+            git_transport=SimpleNamespace(),
+            payload=_pr_payload(),
+            delivery_id="d1",
+            attempts=4,  # > event_max_retries (3)
+            status_tracker=tracker,
+        )
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["preparing", "error"]
+
+
+async def test_review_pr_already_reviewed_posts_only_success(db, settings, monkeypatch, tmp_path, tracker):
+    record: list[tuple] = []
+    # Pre-seed a successful submit AND the ledger entry for the current head:
+    # the shortcut is scoped to the head the review landed on.
+    db.log_tool_call(issue_key="octo/widget#7", tool="submit_pr_review", args={})
     db.upsert_issue(
-        key=key,
+        key="octo/widget#7",
         repo="octo/widget",
-        number=9,
-        state="opened",
-        branch="farm/abc/review",
-        session_dir="/tmp/sess",
-        pr_number=99,
+        number=7,
+        state="reviewing",
+        pr_number=7,
+        last_reviewed_sha="deadbeef",
     )
-    row = db.get_issue(key)
-    assert row is not None
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    monkeypatch.setattr(tasks, "run_task", _never_run_task)
 
-    review_walk_calls: list[tuple[str, int]] = []
-
-    class _FakeGH:
-        async def get_repo(self, repo):
-            return RepoInfo(
-                full_name=repo,
-                default_branch="main",
-                clone_url="https://x/octo/widget.git",
-                private=False,
-            )
-
-        async def get_issue(self, repo, number):
-            return IssueInfo(
-                repo=repo,
-                number=number,
-                title="t",
-                body="b",
-                state="open",
-                author="a",
-                labels=(),
-                is_pull_request=False,
-            )
-
-        async def get_issue_comment(self, repo, comment_id):
-            raise GitHubError(404, "not an issue comment")
-
-        async def get_review_comment(self, repo, comment_id, pr_number=None):
-            review_walk_calls.append((repo, int(comment_id)))
-            return ReviewCommentInfo(
-                id=int(comment_id),
-                author="mira",
-                body="inline finding",
-                path="src/app.py",
-                line=145,
-                created_at="2026-08-07T21:48:00Z",
-            )
-
-    captured: dict[str, object] = {}
-
-    async def fake_run_task(*, task_kind, inputs, pr_number, review_payload, **_kwargs):
-        del inputs, pr_number
-        captured["kind"] = task_kind
-        captured["review_payload"] = review_payload
-
-    async def fake_resolve(**_kwargs):
-        return (row, None)
-
-    async def fake_workspace_op(func, **_kwargs):
-        del func
-        return SimpleNamespace(branch="farm/abc/review", session_dir="/tmp/sess")
-
-    monkeypatch.setattr(tasks, "run_task", fake_run_task)
-    monkeypatch.setattr(tasks, "_resolve_issue_row_for_pr", fake_resolve)
-    monkeypatch.setattr(tasks, "_run_workspace_op", fake_workspace_op)
-
-    await tasks.handle_review(
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    await tasks.review_pr(
         settings=settings,
         db=db,
-        github=_FakeGH(),
-        sandbox=SimpleNamespace(natives_cache=None, ensure_workspace=lambda **k: None),
-        git_transport=None,
-        payload={
-            "pull_request": {"number": 99},
-            "repository": {"full_name": "octo/widget"},
-            "comment": {
-                "id": 42,
-                "body": "Reviewing this PR…",
-                "path": "legacy/path.go",
-                "line": 100,
-                "user": {"login": "stale-bot"},
-            },
-            "sender": {"login": "stale-bot"},
-        },
+        github=_pr_github(record),
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_payload(),
         delivery_id="d1",
+        attempts=1,
+        status_tracker=tracker,
     )
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["success"]
 
-    assert review_walk_calls == [("octo/widget", 42)]
-    assert captured["kind"] == "handle_review"
-    payload = captured["review_payload"]  # type: ignore[index]
-    assert payload["body"] == "inline finding"
-    assert payload["author"] == "mira"
-    assert payload["path"] == "src/app.py"
-    assert payload["line"] == 145
+
+async def test_review_pr_shortcut_does_not_fire_for_new_head(db, settings, monkeypatch, tmp_path, tracker):
+    """A successful audit from an OLDER head must not mark a new push
+    reviewed: the PR was pushed to a new head and re-queued, so the review
+    has to actually run (and the status must not go green without it)."""
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    record: list[tuple] = []
+    db.log_tool_call(issue_key="octo/widget#7", tool="submit_pr_review", args={})
+    # Backdate the prior-run audit OUT of this run's window (audit ts and the
+    # claim's `started_at` are both second-resolution; the window probe uses
+    # `ts >= started_at`, so a same-second stamp would wrongly match).
+    db._conn.execute("UPDATE tool_calls SET ts='2000-01-01T00:00:00' WHERE tool='submit_pr_review'")  # noqa: SLF001
+    db.upsert_issue(
+        key="octo/widget#7",
+        repo="octo/widget",
+        number=7,
+        state="reviewing",
+        pr_number=7,
+        last_reviewed_sha="oldhead000",
+    )
+    ran: list[str] = []
+
+    async def _fake_run_task(*, inputs, **_kw):
+        ran.append(inputs.pr_head_sha)
+
+    monkeypatch.setattr(tasks, "run_task", _fake_run_task)
+    _claim_event(db)
+
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    # The PR now reports a NEW head; the run must execute, not shortcut.
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=_pr_github(record),  # head_sha="deadbeef" != "oldhead000"
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_payload(),
+        delivery_id="d1",
+        attempts=1,
+        status_tracker=tracker,
+    )
+    assert ran == ["deadbeef"], "review ran for the new head"
+    # ...and it finished as a failure (no submit in THIS run), not a shortcut success.
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["preparing", "failure"]
+
+
+async def test_review_pr_success_scoped_to_run_window(db, settings, monkeypatch, tmp_path, tracker):
+    """F12: a successful `submit_pr_review` audit from a PRIOR run must NOT
+    count as the current run's submit: the success decision is scoped to
+    this run's audit window (`ts >= started_at`). No submit in THIS run ->
+    `failure`, not a green `success`."""
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    record: list[tuple] = []
+    db.log_tool_call(issue_key="octo/widget#7", tool="submit_pr_review", args={})
+    # The prior audit predates this run's window.
+    db._conn.execute("UPDATE tool_calls SET ts='2000-01-01T00:00:00' WHERE tool='submit_pr_review'")  # noqa: SLF001
+    # A DIFFERENT head, so the shortcut does not short-circuit and the run
+    # (and its success decision) actually executes.
+    db.upsert_issue(
+        key="octo/widget#7",
+        repo="octo/widget",
+        number=7,
+        state="reviewing",
+        pr_number=7,
+        last_reviewed_sha="oldhead",
+    )
+    ran: list[str] = []
+
+    async def _fake_run_task(*, inputs, **_kw):
+        ran.append(inputs.pr_head_sha)  # NO submit_pr_review audit this run.
+
+    monkeypatch.setattr(tasks, "run_task", _fake_run_task)
+    _claim_event(db)
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=_pr_github(record),
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_payload(),
+        delivery_id="d1",
+        attempts=1,
+        status_tracker=tracker,
+    )
+    assert ran == ["deadbeef"], "the run executed (no shortcut — the prior audit is not a shortcut)"
+    # The prior run's terminal audit must not turn this run green.
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["preparing", "failure"]
+    # The ledger is unchanged: a failed run does not (re)record a head.
+    assert db.get_issue("octo/widget#7").last_reviewed_sha == "oldhead"
+
+
+async def test_review_pr_fetch_failure_posts_terminal_from_payload_sha(db, settings, monkeypatch, tmp_path, tracker):
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    github = _pr_github(record, fail_fetch=True)
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    # Must NOT raise — the fetch-failure path returns early.
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_payload(sha="deadbeef"),
+        delivery_id="d1",
+        attempts=4,  # exhausted -> terminal `error`
+        status_tracker=tracker,
+    )
+    assert len(record) == 1
+    sha, state, context, description = record[0]
+    assert sha == "deadbeef"
+    assert state == "error"
+    assert context == "robomp/pr-review"
+
+
+async def test_review_pr_fetch_github_error_is_terminal_even_on_first_attempt(
+    db, settings, monkeypatch, tmp_path, tracker
+):
+    # The fetch-failure path returns without re-raising, so the queue never
+    # retries — "will retry" would be a lie that sticks at pending forever.
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    github = _pr_github(record, fail_fetch=True)
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_payload(),
+        delivery_id="d1",
+        attempts=1,
+        status_tracker=tracker,
+    )
+    assert [(_sha, _state) for (_sha, _state, _ctx, _d) in record] == [("deadbeef", "error")]
+
+
+async def test_review_pr_fetch_transport_error_posts_per_retry_predicate(db, settings, monkeypatch, tmp_path, tracker):
+    # httpx transport failures re-raise, so the queue DOES retry: the ladder
+    # must mirror the queue's predicate instead of staying stuck at `queued`.
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    github = _pr_github(record, fail_exc=httpx.ConnectError("boom"))
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    with pytest.raises(httpx.ConnectError):
+        await tasks.review_pr(
+            settings=settings,
+            db=db,
+            github=github,
+            sandbox=sandbox,
+            git_transport=SimpleNamespace(),
+            payload=_pr_payload(),
+            delivery_id="d1",
+            attempts=1,
+            status_tracker=tracker,
+        )
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["retrying"]
+
+    record.clear()
+    with pytest.raises(httpx.TimeoutException):
+        await tasks.review_pr(
+            settings=settings,
+            db=db,
+            github=_pr_github(record, fail_exc=httpx.ReadTimeout("slow")),
+            sandbox=sandbox,
+            git_transport=SimpleNamespace(),
+            payload=_pr_payload(),
+            delivery_id="d2",
+            attempts=4,  # exhausted -> terminal
+            status_tracker=tracker,
+        )
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["error"]
+
+
+async def test_review_pr_fetch_non_httpx_transport_error_also_published(db, settings, monkeypatch, tmp_path, tracker):
+    """F8: a non-httpx transport error (e.g. a raw socket OSError) used to
+    escape the fetch block unpublished, leaving the status stuck at `queued`
+    while the queue retried and eventually failed."""
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    github = _pr_github(record, fail_exc=OSError("connection reset by peer"))
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    with pytest.raises(OSError):
+        await tasks.review_pr(
+            settings=settings,
+            db=db,
+            github=github,
+            sandbox=sandbox,
+            git_transport=SimpleNamespace(),
+            payload=_pr_payload(),
+            delivery_id="d1",
+            attempts=1,
+            status_tracker=tracker,
+        )
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["retrying"]
+
+
+async def test_review_pr_fetch_cancellation_posts_retrying(db, settings, monkeypatch, tmp_path, tracker):
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    github = _pr_github(record, fail_exc=asyncio.CancelledError())
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await tasks.review_pr(
+            settings=settings,
+            db=db,
+            github=github,
+            sandbox=sandbox,
+            git_transport=SimpleNamespace(),
+            payload=_pr_payload(),
+            delivery_id="d1",
+            attempts=1,
+            status_tracker=tracker,
+        )
+    assert [_phase_of(d) for (_sha, _state, _ctx, d) in record] == ["retrying"]
+
+
+async def test_review_pr_operator_cancel_posts_terminal_failure(db, settings, monkeypatch, tmp_path, tracker):
+    """F6: an OPERATOR cancel kills the retry — publishing `retrying`
+    ("will retry") would stick on the SHA forever. The cancellation scope
+    (pool + delivery) decides: cancelled -> terminal, drain -> retrying."""
+    from robomp import cancellation
+
+    class _Pool:
+        _cancelled: set[str] = set()
+
+        def _arm_cancel(self, _delivery_id: str, _hook) -> None: ...
+
+        def _disarm_cancel(self, _delivery_id: str) -> None: ...
+
+    pool = _Pool()
+    token = cancellation.set_current_event(pool, "d1")
+    pool._cancelled.add("d1")
+    record: list[tuple] = []
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    github = _pr_github(record, fail_exc=asyncio.CancelledError())
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="b", session_dir=str(tmp_path / "s")),
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await tasks.review_pr(
+                settings=settings,
+                db=db,
+                github=github,
+                sandbox=sandbox,
+                git_transport=SimpleNamespace(),
+                payload=_pr_payload(),
+                delivery_id="d1",
+                attempts=1,
+                status_tracker=tracker,
+            )
+    finally:
+        cancellation.clear_current_event(token)
+    sha, state, _ctx, description = record[0]
+    assert state == "failure"
+    assert description.endswith("— cancelled by operator")
+    assert len(record) == 1, "cancel must post exactly one terminal phase, not a retrying promise"
+
+
+async def test_review_pr_retry_reopens_status_ladder(db, settings, monkeypatch, tmp_path, tracker):
+    """The `attempts > 1` reset path (tasks.py): when a retry starts, its
+    `preparing` post MUST re-open the phase ladder. Without the reset, the
+    monotonic guard skips it as stale against the prior attempt's
+    `publishing` rank — the worker's phase ladder would silently die on the
+    first retry and GitHub would show only the old rank until the terminal.
+
+    Sequence: attempt 1 progresses to `publishing`, then the run raises
+    (`retrying` is posted, which deliberately does NOT advance the rank);
+    attempt 2 (same tracker, same head) must post `preparing` that ACTUALLY
+    lands on the GitHub seam."""
+    monkeypatch.setattr(settings, "pr_review_status_enabled", True)
+    record: list[tuple] = []
+    _claim_event(db)
+
+    calls = {"n": 0}
+
+    async def _fake_run_task(*, inputs, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The agent reached the review-submission host tool: the worker
+            # posts `publishing` on the injected tracker before the run
+            # crashes (timeout, rpc death, ...).
+            await tracker.publish(
+                inputs.github,
+                settings=settings,
+                repo=inputs.repo.full_name,
+                sha=inputs.pr_head_sha,
+                phase="publishing",
+            )
+            raise OSError("run died mid-publish")
+        return None
+
+    monkeypatch.setattr(tasks, "run_task", _fake_run_task)
+    sandbox = SimpleNamespace(
+        natives_cache=None,
+        ensure_workspace=lambda **_kw: SimpleNamespace(branch="farm/x/y", session_dir=str(tmp_path / "s")),
+    )
+    github = _pr_github(record)
+
+    with pytest.raises(OSError):
+        await tasks.review_pr(
+            settings=settings,
+            db=db,
+            github=github,
+            sandbox=sandbox,
+            git_transport=SimpleNamespace(),
+            payload=_pr_payload(),
+            delivery_id="d1",
+            attempts=1,
+            status_tracker=tracker,
+        )
+    phases = [_phase_of(d) for (_sha, _state, _ctx, d) in record]
+    assert phases == ["preparing", "publishing", "retrying"]
+
+    # The retry: the ladder must be re-opened, so THIS `preparing` lands.
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_payload(),
+        delivery_id="d1",
+        attempts=2,
+        status_tracker=tracker,
+    )
+    phases = [_phase_of(d) for (_sha, _state, _ctx, d) in record]
+    # The retry's `preparing` is present (not rank-skipped) and lands on the
+    # same head sha as the rest of the ladder.
+    assert phases == ["preparing", "publishing", "retrying", "preparing", "failure"]
+    assert all(sha == "deadbeef" for (sha, _state, _ctx, _d) in record)
+    assert all(ctx == "robomp/pr-review" for (_sha, _state, ctx, _d) in record)
