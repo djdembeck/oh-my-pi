@@ -1006,6 +1006,34 @@ def _post_pr_issue_comment(
     )
 
 
+def _post_review_comment(
+    client: TestClient,
+    *,
+    delivery: str,
+    user: str,
+    pr_number: int,
+    body: str = "finding",
+    secret: str = "test-webhook-secret",
+):
+    payload = {
+        "action": "created",
+        "comment": {
+            "user": {"login": user},
+            "body": body,
+            "path": "internal/service.py",
+            "line": 10,
+        },
+        "pull_request": {"number": pr_number, "user": {"login": "robomp-bot"}},
+        "repository": {"full_name": "octo/widget"},
+    }
+    raw = json.dumps(payload).encode()
+    return client.post(
+        "/webhook/github",
+        content=raw,
+        headers=_signed_headers(secret, raw, event="pull_request_review_comment", delivery=delivery),
+    )
+
+
 @pytest.fixture
 def rate_limited_settings(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> Settings:
     monkeypatch.setenv("ROBOMP_RATE_LIMIT_DEFAULT", "2")
@@ -1337,6 +1365,28 @@ def test_webhook_unlimited_allowlist_bypasses_limit(rate_limited_settings: Setti
                 number=400 + i,
                 association="NONE",
             )
+            assert resp.json()["state"] == "queued", i
+    close_database()
+
+
+def test_webhook_reviewer_bot_comments_bypass_rate_limit(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    """A reviewer bot posts one comment per finding; the per-user cap must not
+    drop findings after the first few (miracodeai-bot[bot]/coderabbitai[bot])."""
+    monkeypatch.setenv("ROBOMP_RATE_LIMIT_DEFAULT", "2")
+    monkeypatch.setenv("ROBOMP_RATE_LIMIT_UNLIMITED", "")
+    monkeypatch.setenv("ROBOMP_REVIEWER_BOTS", "coderabbitai")
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = _create_app(cfg)
+    with TestClient(app) as client:
+        for i in range(5):
+            resp = _post_review_comment(
+                client,
+                delivery=f"rv-{i}",
+                user="coderabbitai[bot]",
+                pr_number=777,
+            )
+            assert resp.status_code == 202, resp.text
             assert resp.json()["state"] == "queued", i
     close_database()
 

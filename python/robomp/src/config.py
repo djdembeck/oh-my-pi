@@ -286,7 +286,10 @@ class Settings(BaseSettings):
 
     @property
     def rate_limit_unlimited(self) -> frozenset[str]:
-        items = [piece.strip().lstrip("@").lower() for piece in self.rate_limit_unlimited_raw.split(",")]
+        items = [
+            piece.strip().lstrip("@").lower().removesuffix("[bot]")
+            for piece in self.rate_limit_unlimited_raw.split(",")
+        ]
         return frozenset(item for item in items if item)
 
     @field_validator("maintainer_logins_raw", mode="before")

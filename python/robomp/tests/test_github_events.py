@@ -490,6 +490,21 @@ def test_rate_limit_cap_unlimited_allowlist_beats_association() -> None:
     )
 
 
+def test_rate_limit_cap_unlimited_matches_github_bot_suffix() -> None:
+    # GitHub delivers App bots as `<login>[bot]`; the allowlist holds the bare
+    # login because Settings strips the suffix from configured entries.
+    assert (
+        rate_limit_cap(
+            "miracodeai-bot[bot]",
+            "NONE",
+            unlimited=frozenset({"miracodeai-bot"}),
+            default=3,
+            contributor=10,
+        )
+        is None
+    )
+
+
 def test_rate_limit_cap_unlimited_is_case_insensitive() -> None:
     assert (
         rate_limit_cap(

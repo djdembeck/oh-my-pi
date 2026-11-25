@@ -536,7 +536,9 @@ def create_app(settings: Settings | None = None, *, pool_factory: _PoolFactory =
             cap = github_events.rate_limit_cap(
                 submitter,
                 decision.association,
-                unlimited=cfg.rate_limit_unlimited | cfg.maintainer_logins,
+                # Configured reviewer bots author directives and post one comment
+                # per finding; a per-user submission cap drops their findings.
+                unlimited=cfg.rate_limit_unlimited | cfg.maintainer_logins | cfg.reviewer_bots,
                 default=cfg.rate_limit_default,
                 contributor=cfg.rate_limit_contributor,
             )
