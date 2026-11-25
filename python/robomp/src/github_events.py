@@ -499,7 +499,10 @@ def rate_limit_cap(
     Precedence: explicit `unlimited` allowlist > trusted GitHub association
     (`OWNER`/`MEMBER`/`COLLABORATOR`) > `CONTRIBUTOR` tier > default tier.
     """
-    if login.lower() in unlimited:
+    # GitHub App bots reach us as `<name>[bot]` while Forgejo sends `<name>`;
+    # Settings strips the suffix from configured entries, so compare both forms.
+    login_lower = login.lower()
+    if login_lower in unlimited or login_lower.removesuffix("[bot]") in unlimited:
         return None
     if association:
         upper = association.upper()

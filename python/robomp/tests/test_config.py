@@ -257,3 +257,10 @@ def test_max_event_history_below_minimum_rejected(monkeypatch: pytest.MonkeyPatc
     reset_settings_cache()
     with pytest.raises(ValidationError):
         Settings()  # type: ignore[call-arg]
+
+
+def test_rate_limit_unlimited_normalizes_app_suffix(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    monkeypatch.setenv("ROBOMP_RATE_LIMIT_UNLIMITED", " @djdembeck , miracodeai-bot[bot] ,, ")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.rate_limit_unlimited == frozenset({"djdembeck", "miracodeai-bot"})
